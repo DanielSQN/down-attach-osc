@@ -35,3 +35,7 @@ def get_max_workers() -> int:
 
 def get_timeout() -> int:
     return int(os.getenv("OSC_TIMEOUT", "60"))
+
+
+def get_error_log_file() -> str:
+    return os.getenv("ERROR_LOG_FILE", "errors.log")

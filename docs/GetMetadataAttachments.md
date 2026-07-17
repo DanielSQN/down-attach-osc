@@ -89,7 +89,10 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed` (todo sin errore
 | `resumed_srs` | entero | SRs que ya estaban consultados en el checkpoint y no se repitieron. |
 | `attachments` | entero | Filas (adjuntos) totales en el CSV de salida. |
 | `errors` | array | SRs que fallaron: objetos `{ "srNumber": string, "error": string }`. Se reintentan solos en la siguiente corrida. |
+| `verification` | objeto | Confirmación de consistencia: `{ "expected_srs", "consulted", "failed", "ok" }`. `ok` es `true` si todos los SR se consultaron sin errores. |
 | `error` | string | Solo presente si el archivo completo no se pudo procesar (p. ej. columna faltante). |
+
+Además, `result.summary` agrega el total del job: `{ "files", "expected_srs", "consulted", "failed_srs", "all_ok" }`. `all_ok: true` significa que todos los archivos del lote se completaron sin errores.
 
 ---
 

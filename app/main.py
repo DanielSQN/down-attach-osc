@@ -35,6 +35,15 @@ from app.osc_client import METADATA_FIELDS, OscClient, get_file_contents_href
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Log dedicado SOLO a errores (ademas de la consola). Facilita revisar despues
+# que salio mal sin tener que buscar entre todo el log INFO.
+_error_file_handler = logging.FileHandler(config.get_error_log_file(), encoding="utf-8")
+_error_file_handler.setLevel(logging.ERROR)
+_error_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+)
+logging.getLogger().addHandler(_error_file_handler)
+
 # Al apagar el servidor (Ctrl+C) se avisa a los jobs en curso para que
 # cancelen las llamadas pendientes; sin esto la terminal queda bloqueada
 # hasta agotar toda la cola de SRs.
@@ -164,6 +173,20 @@ def attachment_prefix(row: dict) -> str:
 
 def target_subdir(reference: str) -> str:
     return sanitize_filename(reference) or "sin_sr"
+
+
+def resolve_target_path(row: dict, output_folder: str, duplicate_keys: set) -> str:
+    """Ruta destino del binario de una fila; prefija con DmDocumentId solo si choca."""
+    reference = (row.get(REFERENCE_COLUMN) or "").strip()
+    subdir = target_subdir(reference)
+    base = sanitize_filename(attachment_base_name(row))
+    if (subdir, base) in duplicate_keys:
+        # Nombre repetido en el mismo SR: prefija con el id unico del adjunto
+        prefix = attachment_prefix(row)
+        name = sanitize_filename(f"{prefix}_{attachment_base_name(row)}") if prefix else base
+    else:
+        name = base
+    return os.path.join(output_folder, subdir, name)
 
 
 def load_state(folder: str, state_file: str) -> dict:
@@ -315,6 +338,20 @@ def process_input_file(
         # Archivo completo y sin errores: el checkpoint ya no hace falta
         os.remove(progress_path)
 
+    # Verificacion: todo SR esperado quedo consultado o registrado como error
+    consulted = len(pairs) - len(errors)
+    verification = {
+        "expected_srs": len(pairs),
+        "consulted": consulted,
+        "failed": len(errors),
+        "ok": len(errors) == 0,
+    }
+    if errors:
+        logger.error(
+            "Verificacion %s: %d de %d SR fallaron y quedan pendientes de reintento",
+            output_name, len(errors), len(pairs),
+        )
+
     logger.info("Generado %s (%d adjuntos, %d errores)", output_name, attachments, len(errors))
     return {
         "input_file": file_name,
@@ -323,6 +360,7 @@ def process_input_file(
         "resumed_srs": len(pairs) - len(pending),
         "attachments": attachments,
         "errors": errors,
+        "verification": verification,
     }
 
 
@@ -365,10 +403,17 @@ def run_metadata_job(
                     },
                 )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
+        summary = {
+            "files": len(results),
+            "expected_srs": sum(r.get("service_requests", 0) for r in results),
+            "consulted": sum(r.get("verification", {}).get("consulted", 0) for r in results),
+            "failed_srs": sum(len(r.get("errors", [])) for r in results),
+            "all_ok": all(r.get("verification", {}).get("ok", False) for r in results),
+        }
         jobs.finish(
             job_id,
             "completed_with_errors" if had_errors else "completed",
-            result={"results": results},
+            result={"summary": summary, "results": results},
         )
     except Exception as exc:
         logger.exception("Job %s fallo", job_id)
@@ -491,19 +536,8 @@ def download_metadata_file(
 
     def download(row: dict) -> None:
         nonlocal skipped, downloaded
-        reference = (row.get(REFERENCE_COLUMN) or "").strip()
-        subdir = target_subdir(reference)
-        base = sanitize_filename(attachment_base_name(row))
-        if (subdir, base) in duplicate_keys:
-            # Nombre repetido en el mismo SR: prefija con el id unico del adjunto
-            prefix = attachment_prefix(row)
-            name = sanitize_filename(f"{prefix}_{attachment_base_name(row)}") if prefix else base
-        else:
-            name = base
-        # Cada SR tiene su propia subcarpeta para evitar colisiones de nombres
-        target_dir = os.path.join(output_folder, subdir)
-        os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.join(target_dir, name)
+        target_path = resolve_target_path(row, output_folder, duplicate_keys)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
         if os.path.exists(target_path) and not overwrite:
             with counters_lock:
                 skipped += 1
@@ -533,12 +567,32 @@ def download_metadata_file(
         # Los archivos ya descargados se omiten en la proxima corrida
         raise ShutdownRequested()
 
+    # Verificacion: cada adjunto esperado debe existir fisicamente en disco
+    missing = [
+        os.path.relpath(path, output_folder)
+        for path in (resolve_target_path(row, output_folder, duplicate_keys) for row in entries)
+        if not os.path.exists(path)
+    ]
+    if missing:
+        logger.error(
+            "Verificacion %s: faltan %d de %d adjuntos en disco (ej.: %s)",
+            file_name, len(missing), len(entries), "; ".join(missing[:5]),
+        )
+    verification = {
+        "expected": len(entries),
+        "on_disk": len(entries) - len(missing),
+        "missing_count": len(missing),
+        "missing_sample": missing[:20],
+        "ok": not missing and not errors,
+    }
+
     return {
         "metadata_file": file_name,
         "total_rows": len(entries),
         "downloaded": downloaded,
         "skipped_existing": skipped,
         "errors": errors,
+        "verification": verification,
     }
 
 
@@ -582,10 +636,18 @@ def run_binary_job(
                     },
                 )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
+        summary = {
+            "files": len(results),
+            "expected": sum(r.get("total_rows", 0) for r in results),
+            "downloaded": sum(r.get("downloaded", 0) for r in results),
+            "skipped_existing": sum(r.get("skipped_existing", 0) for r in results),
+            "missing": sum(r.get("verification", {}).get("missing_count", 0) for r in results),
+            "all_ok": all(r.get("verification", {}).get("ok", False) for r in results),
+        }
         jobs.finish(
             job_id,
             "completed_with_errors" if had_errors else "completed",
-            result={"results": results},
+            result={"summary": summary, "results": results},
         )
     except Exception as exc:
         logger.exception("Job %s fallo", job_id)
