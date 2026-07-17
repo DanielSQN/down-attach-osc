@@ -114,6 +114,9 @@ def select_batch(files: list[str], state: dict, batch_size: int) -> tuple[list[s
 class MetadataRequest(BaseModel):
     input_folder: str
     output_folder: str
+    # Nombres de archivos especificos a procesar (dentro de input_folder).
+    # Si se envia, se procesan exactamente esos, ignorando batch_size y el manifiesto.
+    files: Optional[list[str]] = None
     batch_size: int = 10  # 0 = procesar todos los pendientes
     force: bool = False  # true = reprocesar aunque esten en _processed_files.json
 
@@ -233,20 +236,31 @@ def run_metadata_job(job_id: str, client: OscClient, batch: list[str], output_fo
 def get_metadata_attachments(request: MetadataRequest):
     if not os.path.isdir(request.input_folder):
         raise HTTPException(status_code=400, detail=f"La carpeta de entrada no existe: {request.input_folder}")
-    input_files = list_csv_files(request.input_folder)
-    if not input_files:
-        raise HTTPException(status_code=400, detail="La carpeta de entrada no contiene archivos .csv")
 
     os.makedirs(request.output_folder, exist_ok=True)
-    state = {} if request.force else load_state(request.output_folder, METADATA_STATE_FILE)
-    batch, pending_after = select_batch(input_files, state, request.batch_size)
-    if not batch:
-        return {
-            "job_id": None,
-            "message": "No hay archivos pendientes: todos estan registrados en "
-            f"{METADATA_STATE_FILE} (use force=true para reprocesar)",
-            "total_files": len(input_files),
-        }
+    if request.files:
+        # Seleccion explicita: se procesan exactamente esos archivos
+        batch = [os.path.join(request.input_folder, name) for name in request.files]
+        missing = [name for name, path in zip(request.files, batch) if not os.path.isfile(path)]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Archivos no encontrados en {request.input_folder}: {', '.join(missing)}",
+            )
+        pending_after = 0
+    else:
+        input_files = list_csv_files(request.input_folder)
+        if not input_files:
+            raise HTTPException(status_code=400, detail="La carpeta de entrada no contiene archivos .csv")
+        state = {} if request.force else load_state(request.output_folder, METADATA_STATE_FILE)
+        batch, pending_after = select_batch(input_files, state, request.batch_size)
+        if not batch:
+            return {
+                "job_id": None,
+                "message": "No hay archivos pendientes: todos estan registrados en "
+                f"{METADATA_STATE_FILE} (use force=true para reprocesar)",
+                "total_files": len(input_files),
+            }
 
     client = build_client()
     job = jobs.create("GetMetadataAttachments", request.model_dump())

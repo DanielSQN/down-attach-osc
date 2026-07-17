@@ -83,6 +83,16 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/GetMetadataAttachments
   }'
 ```
 
+Parámetros del body:
+
+| Campo | Requerido | Descripción |
+|---|---|---|
+| `input_folder` | Sí | Carpeta con los `ServiceRequest_*.csv` a leer. |
+| `output_folder` | Sí | Carpeta donde se generan los CSVs de metadatos y el manifiesto. |
+| `files` | No | Lista de nombres de archivo específicos (dentro de `input_folder`) a procesar, p. ej. `["ServiceRequest_1_1_001.csv", "ServiceRequest_2_3_001.csv"]`. Si se envía, se procesan exactamente esos, ignorando `batch_size` y el manifiesto. |
+| `batch_size` | No | Máximo de archivos pendientes a tomar (por defecto 10; `0` = todos). |
+| `force` | No | `true` = reprocesar aunque estén en el manifiesto. |
+
 Respuesta inmediata:
 
 ```json
