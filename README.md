@@ -130,7 +130,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/GetAttachmentBinary `
   }'
 ```
 
-Descarga en `output_folder\<Reference Number>\<FileName>`.
+Descarga en `output_folder\<Reference Number>\<DmDocumentId>_<FileName>`. El prefijo `DmDocumentId` evita que dos adjuntos del mismo SR con igual `FileName` se pisen (así no se pierde ninguno).
 
 ### 3. Consultar el estatus de un job
 

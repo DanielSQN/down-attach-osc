@@ -151,6 +151,19 @@ def sanitize_filename(name: str) -> str:
     return INVALID_FILENAME_CHARS.sub("_", name).strip() or "sin_nombre"
 
 
+def build_attachment_filename(row: dict) -> str:
+    """Nombre del binario, prefijado con DmDocumentId para evitar colisiones.
+
+    Dos adjuntos del mismo SR pueden compartir FileName (p. ej. 'imagen.png');
+    sin prefijo, el segundo se contaria como 'skipped_existing' y se perderia.
+    Prefijar con el DmDocumentId (unico por adjunto) garantiza que ninguno se
+    sobreescriba. Fallback a AttachedDocumentId si no viniera el DmDocumentId.
+    """
+    base = row.get("FileName") or row.get("Title") or "adjunto"
+    prefix = (row.get("DmDocumentId") or row.get("AttachedDocumentId") or "").strip()
+    return f"{prefix}_{base}" if prefix else base
+
+
 def load_state(folder: str, state_file: str) -> dict:
     path = os.path.join(folder, state_file)
     if not os.path.isfile(path):
@@ -468,7 +481,7 @@ def download_metadata_file(
     def download(row: dict) -> None:
         nonlocal skipped, downloaded
         reference = (row.get(REFERENCE_COLUMN) or "").strip()
-        name = sanitize_filename(row.get("FileName") or row.get("Title") or "adjunto")
+        name = sanitize_filename(build_attachment_filename(row))
         # Cada SR tiene su propia subcarpeta para evitar colisiones de nombres
         target_dir = os.path.join(output_folder, sanitize_filename(reference) or "sin_sr")
         os.makedirs(target_dir, exist_ok=True)
