@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -151,17 +152,18 @@ def sanitize_filename(name: str) -> str:
     return INVALID_FILENAME_CHARS.sub("_", name).strip() or "sin_nombre"
 
 
-def build_attachment_filename(row: dict) -> str:
-    """Nombre del binario, prefijado con DmDocumentId para evitar colisiones.
+def attachment_base_name(row: dict) -> str:
+    """Nombre original del adjunto (FileName; fallback a Title o 'adjunto')."""
+    return row.get("FileName") or row.get("Title") or "adjunto"
 
-    Dos adjuntos del mismo SR pueden compartir FileName (p. ej. 'imagen.png');
-    sin prefijo, el segundo se contaria como 'skipped_existing' y se perderia.
-    Prefijar con el DmDocumentId (unico por adjunto) garantiza que ninguno se
-    sobreescriba. Fallback a AttachedDocumentId si no viniera el DmDocumentId.
-    """
-    base = row.get("FileName") or row.get("Title") or "adjunto"
-    prefix = (row.get("DmDocumentId") or row.get("AttachedDocumentId") or "").strip()
-    return f"{prefix}_{base}" if prefix else base
+
+def attachment_prefix(row: dict) -> str:
+    """Identificador unico del adjunto para desambiguar nombres repetidos."""
+    return (row.get("DmDocumentId") or row.get("AttachedDocumentId") or "").strip()
+
+
+def target_subdir(reference: str) -> str:
+    return sanitize_filename(reference) or "sin_sr"
 
 
 def load_state(folder: str, state_file: str) -> dict:
@@ -473,6 +475,15 @@ def download_metadata_file(
     logger.info("Descargando %s (%d adjuntos)", file_name, len(entries))
     jobs.set_progress(job_id, current_file=file_name, current_file_rows=len(entries))
 
+    # Detecta que destinos (subcarpeta SR + nombre original) se repiten dentro
+    # del CSV. Solo esos adjuntos se prefijan con el DmDocumentId para no
+    # perderse; los que no chocan conservan su FileName original.
+    counts = Counter(
+        (target_subdir((row.get(REFERENCE_COLUMN) or "").strip()), sanitize_filename(attachment_base_name(row)))
+        for row in entries
+    )
+    duplicate_keys = {key for key, n in counts.items() if n > 1}
+
     skipped = 0
     downloaded = 0
     errors: list[dict] = []
@@ -481,9 +492,16 @@ def download_metadata_file(
     def download(row: dict) -> None:
         nonlocal skipped, downloaded
         reference = (row.get(REFERENCE_COLUMN) or "").strip()
-        name = sanitize_filename(build_attachment_filename(row))
+        subdir = target_subdir(reference)
+        base = sanitize_filename(attachment_base_name(row))
+        if (subdir, base) in duplicate_keys:
+            # Nombre repetido en el mismo SR: prefija con el id unico del adjunto
+            prefix = attachment_prefix(row)
+            name = sanitize_filename(f"{prefix}_{attachment_base_name(row)}") if prefix else base
+        else:
+            name = base
         # Cada SR tiene su propia subcarpeta para evitar colisiones de nombres
-        target_dir = os.path.join(output_folder, sanitize_filename(reference) or "sin_sr")
+        target_dir = os.path.join(output_folder, subdir)
         os.makedirs(target_dir, exist_ok=True)
         target_path = os.path.join(target_dir, name)
         if os.path.exists(target_path) and not overwrite:
