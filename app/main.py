@@ -20,6 +20,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -33,9 +34,38 @@ from app.osc_client import METADATA_FIELDS, OscClient, get_file_contents_href
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Al apagar el servidor (Ctrl+C) se avisa a los jobs en curso para que
+# cancelen las llamadas pendientes; sin esto la terminal queda bloqueada
+# hasta agotar toda la cola de SRs.
+shutdown_event = threading.Event()
+_job_threads: list[threading.Thread] = []
+
+
+class ShutdownRequested(Exception):
+    pass
+
+
+def start_job_thread(target, args) -> None:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    _job_threads.append(thread)
+    thread.start()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    shutdown_event.set()
+    # Espera a que los jobs cancelen lo pendiente y dejen su estatus como
+    # 'interrupted'; las llamadas ya en vuelo terminan (acotadas por OSC_TIMEOUT)
+    for thread in _job_threads:
+        if thread.is_alive():
+            thread.join(timeout=config.get_timeout() + 30)
+
+
 app = FastAPI(
     title="down-attach-osc",
     description="Descarga de metadatos y binarios de adjuntos de solicitudes de servicio (Oracle Service Cloud)",
+    lifespan=lifespan,
 )
 
 jobs = JobManager()
@@ -193,6 +223,9 @@ def process_input_file(
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(fetch, pair): pair for pair in pending}
             for future in as_completed(futures):
+                if shutdown_event.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
                 sr_id, reference = futures[future]
                 try:
                     _, items = future.result()
@@ -214,6 +247,10 @@ def process_input_file(
                     prog_fh.write(reference + "\n")
                     prog_fh.flush()
                 jobs.increment(job_id, "srs_consulted")
+
+    if shutdown_event.is_set():
+        # El checkpoint queda en disco: la proxima corrida retoma los SR faltantes
+        raise ShutdownRequested()
 
     with open(output_path, newline="", encoding="utf-8-sig") as fh:
         attachments = max(sum(1 for _ in fh) - 1, 0)
@@ -244,6 +281,10 @@ def run_metadata_job(
             file_name = os.path.basename(csv_path)
             try:
                 result = process_input_file(client, csv_path, output_folder, max_workers, job_id, force)
+            except ShutdownRequested:
+                logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
+                jobs.finish(job_id, "interrupted", result={"results": results})
+                return
             except Exception as exc:
                 result = {"input_file": file_name, "error": str(exc)}
             results.append(result)
@@ -316,11 +357,10 @@ def get_metadata_attachments(request: MetadataRequest):
         srs_consulted=0,
         sr_errors=0,
     )
-    threading.Thread(
-        target=run_metadata_job,
-        args=(job["job_id"], client, batch, request.output_folder, request.force),
-        daemon=True,
-    ).start()
+    start_job_thread(
+        run_metadata_job,
+        (job["job_id"], client, batch, request.output_folder, request.force),
+    )
     return {
         "job_id": job["job_id"],
         "status": "running",
@@ -391,6 +431,9 @@ def download_metadata_file(
     with ThreadPoolExecutor(max_workers=config.get_max_workers()) as pool:
         futures = {pool.submit(download, row): row for row in entries}
         for future in as_completed(futures):
+            if shutdown_event.is_set():
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
             row = futures[future]
             try:
                 future.result()
@@ -399,6 +442,10 @@ def download_metadata_file(
                 logger.error("Error descargando adjunto de SR %s (%s): %s", reference, row.get("FileName"), exc)
                 errors.append({"srNumber": reference, "fileName": row.get("FileName"), "error": str(exc)})
                 jobs.increment(job_id, "download_errors")
+
+    if shutdown_event.is_set():
+        # Los archivos ya descargados se omiten en la proxima corrida
+        raise ShutdownRequested()
 
     return {
         "metadata_file": file_name,
@@ -424,6 +471,10 @@ def run_binary_job(
             file_name = os.path.basename(csv_path)
             try:
                 result = download_metadata_file(client, csv_path, output_folder, overwrite, job_id)
+            except ShutdownRequested:
+                logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
+                jobs.finish(job_id, "interrupted", result={"results": results})
+                return
             except Exception as exc:
                 result = {"metadata_file": file_name, "error": str(exc)}
             results.append(result)
@@ -491,11 +542,10 @@ def get_attachment_binary(request: BinaryRequest):
         skipped_existing=0,
         download_errors=0,
     )
-    threading.Thread(
-        target=run_binary_job,
-        args=(job["job_id"], client, batch, request.output_folder, request.overwrite, track_state),
-        daemon=True,
-    ).start()
+    start_job_thread(
+        run_binary_job,
+        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state),
+    )
     return {
         "job_id": job["job_id"],
         "status": "running",
