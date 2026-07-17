@@ -11,6 +11,12 @@ Los dos métodos son **asíncronos**: encolan un job en segundo plano y devuelve
 | `GET /jobs/{job_id}` | Estatus y avance de un job (`running`, `completed`, `completed_with_errors`, `failed`, `interrupted`). |
 | `GET /jobs` | Lista de los últimos jobs. |
 
+Especificación campo a campo de cada método (petición, respuesta, errores y archivos generados):
+
+- [docs/GetMetadataAttachments.md](docs/GetMetadataAttachments.md)
+- [docs/GetAttachmentBinary.md](docs/GetAttachmentBinary.md)
+- [docs/Jobs.md](docs/Jobs.md)
+
 ## Estrategia de lotes y reanudación
 
 - **Lotes**: cada llamada procesa como máximo `batch_size` archivos (por defecto 10; `0` = todos los pendientes). La respuesta indica cuántos quedan pendientes (`pending_after_batch`), así que basta con volver a llamar al método hasta que responda "No hay archivos pendientes".
