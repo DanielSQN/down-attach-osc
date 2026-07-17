@@ -1,0 +1,59 @@
+# Obtener adjuntos a nivel de solicitud
+ 
+## API adjuntos y retorna lista de adjuntos
+    GET https://<domain>/crmRestApi/resources/11.13.18.05/serviceRequests/<srNumber>/child/Attachment
+
+    {
+        "items": [
+            - AttachedDocumentId
+            - DatatypeCode
+            - FileName
+            - DmDocumentId
+            - UploadedFileContentType
+            - UploadedFileLength
+            - Title
+            - CreationDate
+            - CreatedBy
+            - links (array de objetos con los campos: rel, href, name, kind)
+        
+        ],
+        "count": 1,
+        "hasMore": false,
+        "limit": 100,
+        "offset": 0,
+        "links": []
+    }
+
+    deberas hacer la paginacion iterando el offset enviandolo en la url, si el hasmore es true, limit si deberia no enviarse (por defecto es 25)
+ 
+## La respuesta de adjuntos, devuelve un array de items, donde cada objeto de adjuntos tiene los campos:
+- AttachedDocumentId
+- DatatypeCode
+- FileName
+- DmDocumentId
+- UploadedFileContentType
+- UploadedFileLength
+- Title
+- CreationDate
+- CreatedBy
+- array de links:
+    - se debe filtrar el objeto con los valores con "rel": "enclosure" y "name": "FileContents" para descargar el binario
+ 
+    ```json
+        {
+            "rel": "enclosure",
+            "href": "https://<domain>/crmRestApi/resources/11.13.18.05/serviceRequests/0002859140/child/Attachment/00020000000EACED00057708000110DA8A48D0400000000EACED00057708000110DA8A48D03F/enclosure/FileContents",
+            "name": "FileContents",
+            "kind": "other"
+        }
+    ```
+
+    - con los metadatos por adjuntos (campos dentro de items) se deben guardar en un archivo csv donde sean todas las columnas y una adicional con el href del FileContents
+ 
+    
+
+# funcionalidad:
+    - debera ser un api con varios metodos (GetMetadataAttachments, GetAttachmentBinary)
+    - el metodo GetMetadataAttachments, debera leer una carpeta con archivos asi: ServiceRequest_1_1_001.csv, ServiceRequest_1_2_001.csv (y cada archivo tiene las columnas "Service Request ID","Reference Number") donde el "Reference Number" es el srNumber que se debe usar para llamar a la API de adjuntos y obtener los metadatos de los adjuntos, guardando en un archivo csv por cada archivo de entrada, con los metadatos de los adjuntos y el href del FileContents.
+    - el metodo GetAttachmentBinary, debera leer un archivo csv con los metadatos de los adjuntos (generado por el metodo GetMetadataAttachments) y por cada fila del csv, debera llamar a la URL del href del FileContents para descargar el binario del adjunto y guardarlo en una carpeta con el nombre del FileName.   
+    
