@@ -1,1 +1,138 @@
 # down-attach-osc
+
+API para descargar metadatos y binarios de adjuntos de solicitudes de servicio (Service Requests) de Oracle Service Cloud / Fusion CRM, usando el REST API `crmRestApi` con autenticación **Basic**.
+
+Los dos métodos son **asíncronos**: encolan un job en segundo plano y devuelven de inmediato un `job_id`; el avance y el resultado se consultan en `GET /jobs/{job_id}`.
+
+| Método | Descripción |
+|---|---|
+| `POST /GetMetadataAttachments` | Toma un **lote** (`batch_size`, por defecto 10) de archivos `ServiceRequest_X_Y_00Z.csv` aún no procesados de la carpeta de entrada (columnas `"Service Request ID","Reference Number"`), consulta los adjuntos de cada `Reference Number` (paginación por `offset` mientras `hasMore` sea `true`) y genera **un CSV de metadatos por archivo de entrada** con todas las columnas de metadatos más el `href` del enclosure `FileContents`. |
+| `POST /GetAttachmentBinary` | Toma un CSV de metadatos (`metadata_csv`) o un **lote** de una carpeta de CSVs de metadatos (`metadata_folder`) y, por cada fila, descarga el binario desde el `href` de `FileContents`, guardándolo con el nombre del `FileName` en una subcarpeta por SR. |
+| `GET /jobs/{job_id}` | Estatus y avance de un job (`running`, `completed`, `completed_with_errors`, `failed`, `interrupted`). |
+| `GET /jobs` | Lista de los últimos jobs. |
+
+## Estrategia de lotes y reanudación
+
+- **Lotes**: cada llamada procesa como máximo `batch_size` archivos (por defecto 10; `0` = todos los pendientes). La respuesta indica cuántos quedan pendientes (`pending_after_batch`), así que basta con volver a llamar al método hasta que responda "No hay archivos pendientes".
+- **No reprocesar**: los archivos completados **sin errores** quedan registrados en un manifiesto dentro de la carpeta de salida (`_processed_files.json` para metadatos, `_downloaded_files.json` para binarios) y no se vuelven a tomar en corridas siguientes. Con `"force": true` se ignora el manifiesto y se reprocesa todo.
+- **Reintentos**: un archivo que terminó con errores (algún SR o descarga que falló) **no** se marca como procesado, por lo que la siguiente corrida lo vuelve a tomar automáticamente. En binarios el reintento es barato: los archivos ya existentes en disco se omiten (`skipped_existing`), salvo que se envíe `"overwrite": true`.
+- **Persistencia de jobs**: cada job se guarda en `jobs/<job_id>.json`, así que el estatus se puede consultar aun después de reiniciar el servidor (un job cortado por un reinicio aparece como `interrupted`; basta relanzar el método, el manifiesto evita repetir lo ya hecho).
+
+## Requisitos
+
+- Python 3.10 o superior — <https://www.python.org/downloads/> (en Windows, marcar **"Add Python to PATH"** al instalar)
+- Git — <https://git-scm.com/download/win>
+- Acceso de red al dominio de Oracle y un usuario con permisos sobre el API de Service Requests
+
+## Instalación en Windows
+
+Abrir **PowerShell** y ejecutar:
+
+```powershell
+# 1. Clonar el repositorio
+git clone https://github.com/DanielSQN/down-attach-osc.git
+cd down-attach-osc
+
+# 2. Crear y activar el entorno virtual
+py -3 -m venv venv
+.\venv\Scripts\Activate.ps1
+# Si PowerShell bloquea el script de activación, ejecutar antes:
+#   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+# 3. Instalar dependencias
+pip install -r requirements.txt
+
+# 4. Crear el archivo .env con las credenciales
+copy .env.example .env
+notepad .env
+```
+
+Contenido del `.env`:
+
+```ini
+OSC_DOMAIN=miempresa.fa.us2.oraclecloud.com   # dominio, sin https://
+OSC_USERNAME=usuario.integracion
+OSC_PASSWORD=su_contraseña
+
+# Opcionales
+OSC_MAX_WORKERS=5   # llamadas en paralelo
+OSC_TIMEOUT=60      # timeout por llamada (segundos)
+```
+
+> El `.env` está en `.gitignore`: las credenciales nunca se suben al repositorio.
+
+## Ejecutar el API
+
+```powershell
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Con el servidor levantado, la documentación interactiva (Swagger) queda en <http://127.0.0.1:8000/docs> — desde ahí se pueden probar todos los métodos.
+
+## Uso
+
+### 1. GetMetadataAttachments
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/GetMetadataAttachments `
+  -ContentType "application/json" `
+  -Body '{
+    "input_folder":  "C:\\Users\\daniel\\Downloads\\ServiceRequest20260710_2038\\ServiceRequest",
+    "output_folder": "C:\\Users\\daniel\\Downloads\\metadatos",
+    "batch_size": 10
+  }'
+```
+
+Respuesta inmediata:
+
+```json
+{
+  "job_id": "6a7f9497a6e8",
+  "status": "running",
+  "files_in_batch": ["ServiceRequest_1_1_001.csv", "..."],
+  "pending_after_batch": 8,
+  "status_url": "/jobs/6a7f9497a6e8"
+}
+```
+
+Genera un `<nombre>_attachments.csv` por archivo de entrada, con columnas: `Service Request ID`, `Reference Number`, `AttachedDocumentId`, `DatatypeCode`, `FileName`, `DmDocumentId`, `UploadedFileContentType`, `UploadedFileLength`, `Title`, `CreationDate`, `CreatedBy`, `FileContentsHref`.
+
+### 2. GetAttachmentBinary
+
+Por carpeta (lotes, recomendado) o por archivo puntual (`"metadata_csv": "...ruta..."`):
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/GetAttachmentBinary `
+  -ContentType "application/json" `
+  -Body '{
+    "metadata_folder": "C:\\Users\\daniel\\Downloads\\metadatos",
+    "output_folder":   "C:\\Users\\daniel\\Downloads\\adjuntos",
+    "batch_size": 10
+  }'
+```
+
+Descarga en `output_folder\<Reference Number>\<FileName>`.
+
+### 3. Consultar el estatus de un job
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/jobs/6a7f9497a6e8
+```
+
+```json
+{
+  "job_id": "6a7f9497a6e8",
+  "type": "GetMetadataAttachments",
+  "status": "running",
+  "progress": {
+    "total_files": 10,
+    "processed_files": 3,
+    "current_file": "ServiceRequest_1_4_001.csv",
+    "srs_consulted": 2140,
+    "sr_errors": 2,
+    "pending_after_batch": 8
+  }
+}
+```
+
+Al terminar, `status` pasa a `completed` (o `completed_with_errors`) y `result.results` trae el detalle por archivo, incluyendo la lista de errores. Los errores por SR o adjunto no detienen el job.
