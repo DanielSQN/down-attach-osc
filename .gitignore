@@ -6,3 +6,5 @@ __pycache__/
 output/
 downloads/
 jobs/
+errors.log
+*.log

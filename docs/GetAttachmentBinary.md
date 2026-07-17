@@ -81,7 +81,10 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed`, `completed_with
 | `downloaded` | entero | Binarios descargados en esta corrida. |
 | `skipped_existing` | entero | Binarios omitidos por ya existir en disco. |
 | `errors` | array | Descargas fallidas: objetos `{ "srNumber": string, "fileName": string, "error": string }`. Se reintentan solos en la siguiente corrida. |
+| `verification` | objeto | Confirmación en disco: `{ "expected", "on_disk", "missing_count", "missing_sample", "ok" }`. Se recalcula qué archivos destino existen físicamente; `ok` es `true` si no falta ninguno. `missing_sample` lista hasta 20 rutas faltantes. |
 | `error` | string | Solo presente si el CSV completo no se pudo procesar (p. ej. sin columna `FileContentsHref`). |
+
+Además, `result.summary` agrega el total del job: `{ "files", "expected", "downloaded", "skipped_existing", "missing", "all_ok" }`. `all_ok: true` significa que todos los adjuntos esperados quedaron en disco.
 
 ---
 

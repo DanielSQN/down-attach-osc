@@ -26,6 +26,8 @@ Especificación campo a campo de cada método (petición, respuesta, errores y a
 - **Reintentos**: un archivo que terminó con errores (algún SR o descarga que falló) **no** se marca como procesado, por lo que la siguiente corrida lo vuelve a tomar automáticamente — en metadatos reintenta solo los SR que fallaron (gracias al checkpoint) y en binarios los archivos ya existentes en disco se omiten (`skipped_existing`), salvo que se envíe `"overwrite": true`.
 - **Persistencia de jobs**: cada job se guarda en `jobs/<job_id>.json`, así que el estatus se puede consultar aun después de reiniciar el servidor (un job cortado por un reinicio aparece como `interrupted`; basta relanzar el método, el manifiesto evita repetir lo ya hecho).
 - **Ctrl+C seguro**: al detener el servidor con Ctrl+C, los jobs en curso cancelan las llamadas pendientes, dejan su estatus como `interrupted` y el proceso termina en segundos (las llamadas ya en vuelo terminan, acotadas por `OSC_TIMEOUT`). Al relanzar el servidor y repetir el llamado, el checkpoint retoma exactamente donde quedó.
+- **Verificación**: al terminar cada job, `result.summary` trae un `all_ok` y los totales (SRs esperados/consultados/fallidos en metadatos; adjuntos esperados/en disco/faltantes en binarios). En binarios se recalcula que cada archivo esperado exista físicamente en disco. Cada archivo del lote incluye además su propio bloque `verification`.
+- **Log solo de errores**: además de la consola, todos los errores (SRs o descargas que fallan, y verificaciones con faltantes) se escriben en un archivo aparte — `errors.log` por defecto, configurable con `ERROR_LOG_FILE` — para revisarlos sin ruido. Si no hubo errores, queda vacío.
 
 ## Requisitos
 
