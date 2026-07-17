@@ -53,8 +53,13 @@ class OscClient:
         return items
 
     def download_binary(self, href: str, target_path: str) -> None:
-        """Descarga el binario del enclosure FileContents a target_path."""
-        with self.session.get(href, timeout=self.timeout, stream=True) as response:
+        """Descarga el binario del enclosure FileContents a target_path.
+
+        Se sobreescribe el Accept de la sesion (application/json) porque el
+        enclosure devuelve un binario y Oracle responde 406 si se pide JSON.
+        """
+        headers = {"Accept": "*/*"}
+        with self.session.get(href, headers=headers, timeout=self.timeout, stream=True) as response:
             response.raise_for_status()
             with open(target_path, "wb") as fh:
                 for chunk in response.iter_content(chunk_size=1024 * 256):
