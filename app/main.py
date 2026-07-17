@@ -141,57 +141,101 @@ def read_sr_numbers(csv_path: str) -> list[tuple[str, str]]:
 
 
 def process_input_file(
-    client: OscClient, csv_path: str, output_folder: str, max_workers: int, job_id: str
+    client: OscClient, csv_path: str, output_folder: str, max_workers: int, job_id: str, force: bool = False
 ) -> dict:
-    """Consulta los adjuntos de cada SR del archivo y escribe el CSV de metadatos."""
+    """Consulta los adjuntos de cada SR del archivo y escribe el CSV de metadatos.
+
+    Escritura incremental: cada SR consultado se agrega de inmediato al CSV de
+    salida y su numero queda registrado en un checkpoint (<salida>.progress).
+    Si el proceso se corta, la siguiente corrida retoma solo los SR faltantes.
+    """
     file_name = os.path.basename(csv_path)
     pairs = read_sr_numbers(csv_path)
-    logger.info("Procesando %s (%d solicitudes)", file_name, len(pairs))
-    jobs.set_progress(job_id, current_file=file_name, current_file_srs=len(pairs))
-
-    rows: list[dict] = []
-    errors: list[dict] = []
-
-    def fetch(pair: tuple[str, str]) -> tuple[tuple[str, str], list[dict]]:
-        return pair, client.get_attachments(pair[1])
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(fetch, pair): pair for pair in pairs}
-        for future in as_completed(futures):
-            sr_id, reference = futures[future]
-            try:
-                _, items = future.result()
-            except Exception as exc:
-                logger.error("Error consultando adjuntos de SR %s: %s", reference, exc)
-                errors.append({"srNumber": reference, "error": str(exc)})
-                jobs.increment(job_id, "sr_errors")
-                continue
-            jobs.increment(job_id, "srs_consulted")
-            for item in items:
-                row = {SR_ID_COLUMN: sr_id, REFERENCE_COLUMN: reference}
-                for field in METADATA_FIELDS:
-                    row[field] = item.get(field, "")
-                row[HREF_COLUMN] = get_file_contents_href(item)
-                rows.append(row)
-
     output_name = f"{os.path.splitext(file_name)[0]}_attachments.csv"
     output_path = os.path.join(output_folder, output_name)
-    with open(output_path, "w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=OUTPUT_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    progress_path = output_path + ".progress"
 
-    logger.info("Generado %s (%d adjuntos, %d errores)", output_name, len(rows), len(errors))
+    done: set[str] = set()
+    if force:
+        for path in (output_path, progress_path):
+            if os.path.exists(path):
+                os.remove(path)
+    elif os.path.isfile(progress_path) and os.path.isfile(output_path):
+        with open(progress_path, encoding="utf-8") as fh:
+            done = {line.strip() for line in fh if line.strip()}
+
+    pending = [pair for pair in pairs if pair[1] not in done]
+    resuming = bool(done)
+    logger.info(
+        "Procesando %s (%d solicitudes, %d ya consultadas, %d pendientes)",
+        file_name, len(pairs), len(pairs) - len(pending), len(pending),
+    )
+    jobs.set_progress(
+        job_id,
+        current_file=file_name,
+        current_file_srs=len(pairs),
+        current_file_pending=len(pending),
+    )
+
+    errors: list[dict] = []
+    write_lock = threading.Lock()
+
+    with open(output_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as out_fh, \
+            open(progress_path, "a" if resuming else "w", encoding="utf-8") as prog_fh:
+        writer = csv.DictWriter(out_fh, fieldnames=OUTPUT_COLUMNS)
+        if not resuming:
+            writer.writeheader()
+            out_fh.flush()
+
+        def fetch(pair: tuple[str, str]) -> tuple[tuple[str, str], list[dict]]:
+            return pair, client.get_attachments(pair[1])
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(fetch, pair): pair for pair in pending}
+            for future in as_completed(futures):
+                sr_id, reference = futures[future]
+                try:
+                    _, items = future.result()
+                except Exception as exc:
+                    logger.error("Error consultando adjuntos de SR %s: %s", reference, exc)
+                    errors.append({"srNumber": reference, "error": str(exc)})
+                    jobs.increment(job_id, "sr_errors")
+                    continue
+                rows = []
+                for item in items:
+                    row = {SR_ID_COLUMN: sr_id, REFERENCE_COLUMN: reference}
+                    for field in METADATA_FIELDS:
+                        row[field] = item.get(field, "")
+                    row[HREF_COLUMN] = get_file_contents_href(item)
+                    rows.append(row)
+                with write_lock:
+                    writer.writerows(rows)
+                    out_fh.flush()
+                    prog_fh.write(reference + "\n")
+                    prog_fh.flush()
+                jobs.increment(job_id, "srs_consulted")
+
+    with open(output_path, newline="", encoding="utf-8-sig") as fh:
+        attachments = max(sum(1 for _ in fh) - 1, 0)
+
+    if not errors:
+        # Archivo completo y sin errores: el checkpoint ya no hace falta
+        os.remove(progress_path)
+
+    logger.info("Generado %s (%d adjuntos, %d errores)", output_name, attachments, len(errors))
     return {
         "input_file": file_name,
         "output_file": output_path,
         "service_requests": len(pairs),
-        "attachments": len(rows),
+        "resumed_srs": len(pairs) - len(pending),
+        "attachments": attachments,
         "errors": errors,
     }
 
 
-def run_metadata_job(job_id: str, client: OscClient, batch: list[str], output_folder: str) -> None:
+def run_metadata_job(
+    job_id: str, client: OscClient, batch: list[str], output_folder: str, force: bool = False
+) -> None:
     max_workers = config.get_max_workers()
     results: list[dict] = []
     had_errors = False
@@ -199,7 +243,7 @@ def run_metadata_job(job_id: str, client: OscClient, batch: list[str], output_fo
         for index, csv_path in enumerate(batch, start=1):
             file_name = os.path.basename(csv_path)
             try:
-                result = process_input_file(client, csv_path, output_folder, max_workers, job_id)
+                result = process_input_file(client, csv_path, output_folder, max_workers, job_id, force)
             except Exception as exc:
                 result = {"input_file": file_name, "error": str(exc)}
             results.append(result)
@@ -274,7 +318,7 @@ def get_metadata_attachments(request: MetadataRequest):
     )
     threading.Thread(
         target=run_metadata_job,
-        args=(job["job_id"], client, batch, request.output_folder),
+        args=(job["job_id"], client, batch, request.output_folder, request.force),
         daemon=True,
     ).start()
     return {
