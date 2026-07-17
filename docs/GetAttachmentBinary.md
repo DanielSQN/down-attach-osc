@@ -87,7 +87,7 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed`, `completed_with
 
 ## Archivos generados
 
-- Binarios en `output_folder/<Reference Number>/<FileName>`. Los caracteres inválidos para Windows en el nombre (`< > : " / \ | ? *`) se reemplazan por `_`. Si la fila no trae `FileName`, se usa `Title` y en último caso `adjunto`.
+- Binarios en `output_folder/<Reference Number>/<DmDocumentId>_<FileName>`. El nombre se prefija con el `DmDocumentId` (único por adjunto) para que dos adjuntos del mismo SR con el mismo `FileName` no colisionen ni se pierdan; si no viniera `DmDocumentId` se usa `AttachedDocumentId`. Los caracteres inválidos para Windows en el nombre (`< > : " / \ | ? *`) se reemplazan por `_`. Si la fila no trae `FileName`, se usa `Title` y en último caso `adjunto`.
 - `_downloaded_files.json` — manifiesto (en `output_folder`) de CSVs de metadatos completados sin errores; no se vuelven a tomar en modo `metadata_folder`.
 
 > Nota técnica: la descarga envía `Accept: */*` (el enclosure devuelve binario; pedir JSON produce 406 en Oracle).
