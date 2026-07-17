@@ -18,6 +18,7 @@ Los dos métodos son **asíncronos**: encolan un job en segundo plano y devuelve
 - **Escritura en tiempo real (metadatos)**: pensado para archivos de entrada grandes (50k+ líneas). Cada SR consultado se agrega de inmediato al CSV de salida y queda registrado en un checkpoint (`<salida>.progress`). Si el proceso se corta o algunos SR fallan, la siguiente corrida del mismo archivo retoma **solo los SR faltantes** — nunca se repite lo ya consultado. Al completarse el archivo sin errores, el checkpoint se elimina y el archivo pasa al manifiesto.
 - **Reintentos**: un archivo que terminó con errores (algún SR o descarga que falló) **no** se marca como procesado, por lo que la siguiente corrida lo vuelve a tomar automáticamente — en metadatos reintenta solo los SR que fallaron (gracias al checkpoint) y en binarios los archivos ya existentes en disco se omiten (`skipped_existing`), salvo que se envíe `"overwrite": true`.
 - **Persistencia de jobs**: cada job se guarda en `jobs/<job_id>.json`, así que el estatus se puede consultar aun después de reiniciar el servidor (un job cortado por un reinicio aparece como `interrupted`; basta relanzar el método, el manifiesto evita repetir lo ya hecho).
+- **Ctrl+C seguro**: al detener el servidor con Ctrl+C, los jobs en curso cancelan las llamadas pendientes, dejan su estatus como `interrupted` y el proceso termina en segundos (las llamadas ya en vuelo terminan, acotadas por `OSC_TIMEOUT`). Al relanzar el servidor y repetir el llamado, el checkpoint retoma exactamente donde quedó.
 
 ## Requisitos
 
