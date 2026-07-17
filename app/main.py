@@ -82,6 +82,54 @@ INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 _state_lock = threading.Lock()
 
+# Archivos reservados por jobs en curso. Permite lanzar varios jobs en lote
+# sobre la misma carpeta: cada uno reserva sus archivos al iniciar y los
+# demas los saltan, evitando que dos jobs escriban el mismo CSV/checkpoint.
+_active_files_lock = threading.Lock()
+_active_files: set[tuple[str, str, str]] = set()
+
+
+def _file_key(output_folder: str, state_file: str, name: str) -> tuple[str, str, str]:
+    return (os.path.abspath(output_folder), state_file, name)
+
+
+def reserve_batch(
+    files: list[str], output_folder: str, state_file: str, state: dict, batch_size: int
+) -> tuple[list[str], int]:
+    """Selecciona y reserva atomicamente el siguiente lote de archivos pendientes.
+
+    Excluye los ya procesados (manifiesto) y los reservados por otros jobs.
+    """
+    with _active_files_lock:
+        pending = [
+            f for f in files
+            if os.path.basename(f) not in state
+            and _file_key(output_folder, state_file, os.path.basename(f)) not in _active_files
+        ]
+        batch = pending[:batch_size] if batch_size > 0 else pending
+        for f in batch:
+            _active_files.add(_file_key(output_folder, state_file, os.path.basename(f)))
+        return batch, len(pending) - len(batch)
+
+
+def reserve_explicit(paths: list[str], output_folder: str, state_file: str) -> list[str]:
+    """Reserva archivos pedidos explicitamente; devuelve los que ya estan ocupados."""
+    with _active_files_lock:
+        busy = [
+            os.path.basename(p) for p in paths
+            if _file_key(output_folder, state_file, os.path.basename(p)) in _active_files
+        ]
+        if busy:
+            return busy
+        for p in paths:
+            _active_files.add(_file_key(output_folder, state_file, os.path.basename(p)))
+        return []
+
+
+def release_file(output_folder: str, state_file: str, name: str) -> None:
+    with _active_files_lock:
+        _active_files.discard(_file_key(output_folder, state_file, name))
+
 
 # ---------------------------------------------------------------------------
 # Utilidades
@@ -128,13 +176,6 @@ def list_csv_files(folder: str) -> list[str]:
         for name in os.listdir(folder)
         if name.lower().endswith(".csv") and not name.startswith("_")
     )
-
-
-def select_batch(files: list[str], state: dict, batch_size: int) -> tuple[list[str], int]:
-    """Filtra los archivos ya procesados y devuelve (lote, pendientes restantes)."""
-    pending = [f for f in files if os.path.basename(f) not in state]
-    batch = pending[: batch_size] if batch_size > 0 else pending
-    return batch, len(pending) - len(batch)
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +328,8 @@ def run_metadata_job(
                 return
             except Exception as exc:
                 result = {"input_file": file_name, "error": str(exc)}
+            finally:
+                release_file(output_folder, METADATA_STATE_FILE, file_name)
             results.append(result)
 
             file_failed = "error" in result or bool(result.get("errors"))
@@ -315,6 +358,10 @@ def run_metadata_job(
     except Exception as exc:
         logger.exception("Job %s fallo", job_id)
         jobs.finish(job_id, "failed", error=str(exc))
+    finally:
+        # Libera cualquier reserva restante (archivos no procesados por corte o fallo)
+        for csv_path in batch:
+            release_file(output_folder, METADATA_STATE_FILE, os.path.basename(csv_path))
 
 
 @app.post("/GetMetadataAttachments")
@@ -322,6 +369,7 @@ def get_metadata_attachments(request: MetadataRequest):
     if not os.path.isdir(request.input_folder):
         raise HTTPException(status_code=400, detail=f"La carpeta de entrada no existe: {request.input_folder}")
 
+    client = build_client()
     os.makedirs(request.output_folder, exist_ok=True)
     if request.files:
         # Seleccion explicita: se procesan exactamente esos archivos
@@ -332,22 +380,29 @@ def get_metadata_attachments(request: MetadataRequest):
                 status_code=400,
                 detail=f"Archivos no encontrados en {request.input_folder}: {', '.join(missing)}",
             )
+        busy = reserve_explicit(batch, request.output_folder, METADATA_STATE_FILE)
+        if busy:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Archivos en proceso por otro job: {', '.join(busy)}",
+            )
         pending_after = 0
     else:
         input_files = list_csv_files(request.input_folder)
         if not input_files:
             raise HTTPException(status_code=400, detail="La carpeta de entrada no contiene archivos .csv")
         state = {} if request.force else load_state(request.output_folder, METADATA_STATE_FILE)
-        batch, pending_after = select_batch(input_files, state, request.batch_size)
+        batch, pending_after = reserve_batch(
+            input_files, request.output_folder, METADATA_STATE_FILE, state, request.batch_size
+        )
         if not batch:
             return {
                 "job_id": None,
                 "message": "No hay archivos pendientes: todos estan registrados en "
-                f"{METADATA_STATE_FILE} (use force=true para reprocesar)",
+                f"{METADATA_STATE_FILE} o en proceso por otro job (use force=true para reprocesar)",
                 "total_files": len(input_files),
             }
 
-    client = build_client()
     job = jobs.create("GetMetadataAttachments", request.model_dump())
     jobs.set_progress(
         job["job_id"],
@@ -477,6 +532,8 @@ def run_binary_job(
                 return
             except Exception as exc:
                 result = {"metadata_file": file_name, "error": str(exc)}
+            finally:
+                release_file(output_folder, BINARY_STATE_FILE, file_name)
             results.append(result)
 
             file_failed = "error" in result or bool(result.get("errors"))
@@ -502,14 +559,25 @@ def run_binary_job(
     except Exception as exc:
         logger.exception("Job %s fallo", job_id)
         jobs.finish(job_id, "failed", error=str(exc))
+    finally:
+        for csv_path in batch:
+            release_file(output_folder, BINARY_STATE_FILE, os.path.basename(csv_path))
 
 
 @app.post("/GetAttachmentBinary")
 def get_attachment_binary(request: BinaryRequest):
+    client = build_client()
+    os.makedirs(request.output_folder, exist_ok=True)
     if request.metadata_csv:
         if not os.path.isfile(request.metadata_csv):
             raise HTTPException(status_code=400, detail=f"El archivo de metadatos no existe: {request.metadata_csv}")
         batch = [request.metadata_csv]
+        busy = reserve_explicit(batch, request.output_folder, BINARY_STATE_FILE)
+        if busy:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Archivos en proceso por otro job: {', '.join(busy)}",
+            )
         pending_after = 0
         track_state = False  # un archivo pedido explicitamente se procesa siempre
     else:
@@ -518,20 +586,19 @@ def get_attachment_binary(request: BinaryRequest):
         files = list_csv_files(request.metadata_folder)
         if not files:
             raise HTTPException(status_code=400, detail="La carpeta de metadatos no contiene archivos .csv")
-        os.makedirs(request.output_folder, exist_ok=True)
         state = {} if request.force else load_state(request.output_folder, BINARY_STATE_FILE)
-        batch, pending_after = select_batch(files, state, request.batch_size)
+        batch, pending_after = reserve_batch(
+            files, request.output_folder, BINARY_STATE_FILE, state, request.batch_size
+        )
         track_state = True
         if not batch:
             return {
                 "job_id": None,
                 "message": "No hay archivos pendientes: todos estan registrados en "
-                f"{BINARY_STATE_FILE} (use force=true para reprocesar)",
+                f"{BINARY_STATE_FILE} o en proceso por otro job (use force=true para reprocesar)",
                 "total_files": len(files),
             }
 
-    os.makedirs(request.output_folder, exist_ok=True)
-    client = build_client()
     job = jobs.create("GetAttachmentBinary", request.model_dump())
     jobs.set_progress(
         job["job_id"],

@@ -69,8 +69,11 @@ Cuando **no** hay archivos pendientes (todos en el manifiesto):
 | Código | Causa |
 |---|---|
 | `400` | `input_folder` no existe; la carpeta no contiene CSVs; algún nombre de `files` no existe en la carpeta. El detalle viene en el campo `detail`. |
+| `409` | Algún archivo de `files` está siendo procesado por otro job en este momento. Esperar a que ese job termine o pedir otros archivos. |
 | `422` | Body inválido (campo faltante o de tipo incorrecto). |
 | `500` | Falta alguna variable en el `.env` (`OSC_DOMAIN`, `OSC_USERNAME`, `OSC_PASSWORD`). |
+
+> **Jobs en paralelo**: se pueden lanzar varias llamadas en lote a la vez sobre la misma carpeta; cada job reserva sus archivos al iniciar y los demás toman los siguientes pendientes, sin traslapes.
 
 ---
 

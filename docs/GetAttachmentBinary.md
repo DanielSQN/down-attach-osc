@@ -62,8 +62,11 @@ Cuando **no** hay CSVs pendientes (solo en modo `metadata_folder`):
 | Código | Causa |
 |---|---|
 | `400` | `metadata_csv` no existe; `metadata_folder` no existe o no contiene CSVs. El detalle viene en el campo `detail`. |
+| `409` | El `metadata_csv` pedido está siendo procesado por otro job en este momento. |
 | `422` | Body inválido; o se enviaron ambos (o ninguno) de `metadata_csv` / `metadata_folder`. |
 | `500` | Falta alguna variable en el `.env` (`OSC_DOMAIN`, `OSC_USERNAME`, `OSC_PASSWORD`). |
+
+> **Jobs en paralelo**: se pueden lanzar varias llamadas con `metadata_folder` a la vez; cada job reserva sus CSVs al iniciar y los demás toman los siguientes pendientes, sin traslapes.
 
 ---
 
