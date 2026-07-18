@@ -6,6 +6,7 @@ import threading
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class OscClient:
         max_retries: int = 4,
         backoff: float = 1.0,
         abort_event: threading.Event | None = None,
+        pool_size: int = 10,
     ):
         self.base_url = f"https://{domain}{API_PATH}"
         self.timeout = timeout
@@ -48,6 +50,11 @@ class OscClient:
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(username, password)
         self.session.headers.update({"Accept": "application/json"})
+        # Pool de conexiones dimensionado a los workers: evita abrir/cerrar
+        # conexiones TLS constantemente cuando hay mas workers que el default (10)
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=max(pool_size, 10))
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     # ------------------------------------------------------------------
     # Reintentos con backoff exponencial para errores transitorios

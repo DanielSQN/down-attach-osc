@@ -1,4 +1,4 @@
-# Consulta de jobs
+# Consulta de jobs y health check
 
 Los dos métodos de negocio ([GetMetadataAttachments](GetMetadataAttachments.md) y [GetAttachmentBinary](GetAttachmentBinary.md)) corren en segundo plano y devuelven un `job_id`. Estos endpoints permiten consultar su avance y resultado. Cada job se persiste en `jobs/<job_id>.json`, por lo que puede consultarse incluso después de reiniciar el servidor.
 
@@ -38,7 +38,7 @@ Devuelve el detalle completo de un job.
 | `running` | El job está en ejecución. |
 | `completed` | Terminó y todos los archivos se procesaron sin errores. |
 | `completed_with_errors` | Terminó, pero algún SR o descarga falló (detalle en `result.results[].errors`); los fallidos se reintentan en la siguiente corrida del método. |
-| `interrupted` | Cortado por apagado del servidor (Ctrl+C o reinicio). Lo ya hecho quedó en disco; relanzar el método retoma desde el checkpoint/manifiesto. |
+| `interrupted` | Cortado por apagado del servidor (Ctrl+C o reinicio), **o por el circuit breaker** (demasiados fallos transitorios consecutivos: servicio caído/mantenimiento — el motivo queda en el campo `error`). Lo ya hecho quedó en disco; verificar con `GET /health` que el servicio volvió y relanzar el método: retoma desde el checkpoint/manifiesto. |
 | `failed` | Error fatal inesperado; ver campo `error`. |
 
 ### Campos de `progress` — job GetMetadataAttachments
@@ -126,3 +126,26 @@ Lista los últimos jobs (de ambos tipos), el más reciente primero.
 | `jobs` | array | Resumen de cada job, ordenados por `created_at` descendente. |
 
 Cada elemento de `jobs` trae un subconjunto de los campos del detalle: `job_id`, `type`, `status`, `created_at`, `finished_at` y `progress` (sin `params`, `result` ni `error` — para eso usar `GET /jobs/{job_id}`).
+
+---
+
+## GET /health
+
+Hace una llamada mínima al API de Oracle (1 registro, solo el campo `SrNumber`) para saber si el servicio responde. Útil para verificar que un mantenimiento terminó antes de relanzar los jobs. No usa reintentos: refleja el estado actual.
+
+- **URL**: `http://<host>:8000/health`
+- **Método**: `GET`
+
+### Respuesta (200)
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `oracle_ok` | booleano | `true` si Oracle respondió `200` a la llamada de prueba. |
+| `status_code` | entero | Código HTTP devuelto por Oracle (ausente si ni siquiera hubo respuesta). |
+| `error` | string | Solo si la llamada falló por red/timeout: el detalle del error. |
+| `elapsed_ms` | entero | Milisegundos que tardó la llamada. |
+
+```powershell
+# Esperar a que Oracle vuelva de mantenimiento (revisa cada 60 s):
+while (-not (Invoke-RestMethod http://127.0.0.1:8000/health).oracle_ok) { Start-Sleep 60 }
+```
