@@ -19,18 +19,20 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from app import config
 from app.jobs import JobManager
-from app.osc_client import METADATA_FIELDS, OscClient, get_file_contents_href
+from app.osc_client import METADATA_FIELDS, RETRYABLE_STATUS, OscClient, get_file_contents_href
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,6 +55,47 @@ _job_threads: list[threading.Thread] = []
 
 class ShutdownRequested(Exception):
     pass
+
+
+class CircuitOpen(Exception):
+    """El servicio parece caido: demasiados fallos transitorios consecutivos."""
+
+
+class CircuitBreaker:
+    """Abre el circuito tras N fallos transitorios consecutivos (5xx/429/red).
+
+    Evita quemar reintentos contra un servicio caido (p. ej. mantenimiento de
+    Oracle): el job se detiene como 'interrupted' y se reanuda al relanzarlo.
+    Un exito reinicia el contador. threshold <= 0 lo desactiva.
+    """
+
+    def __init__(self, threshold: int):
+        self.threshold = threshold
+        self._consecutive = 0
+        self._lock = threading.Lock()
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive = 0
+
+    def record_failure(self) -> int:
+        with self._lock:
+            self._consecutive += 1
+            return self._consecutive
+
+    def is_open(self) -> bool:
+        with self._lock:
+            return self.threshold > 0 and self._consecutive >= self.threshold
+
+
+def is_transient_error(exc: Exception) -> bool:
+    """True si el error es de servicio/red (5xx, 429, conexion, timeout)."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        return response is not None and response.status_code in RETRYABLE_STATUS
+    return False
 
 
 def start_job_thread(target, args) -> None:
@@ -145,7 +188,7 @@ def release_file(output_folder: str, state_file: str, name: str) -> None:
 # Utilidades
 # ---------------------------------------------------------------------------
 
-def build_client() -> OscClient:
+def build_client(pool_size: int = 10) -> OscClient:
     try:
         return OscClient(
             domain=config.get_domain(),
@@ -155,6 +198,7 @@ def build_client() -> OscClient:
             max_retries=config.get_max_retries(),
             backoff=config.get_retry_backoff(),
             abort_event=shutdown_event,
+            pool_size=pool_size,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -231,6 +275,8 @@ class MetadataRequest(BaseModel):
     files: Optional[list[str]] = None
     batch_size: int = 10  # 0 = procesar todos los pendientes
     force: bool = False  # true = reprocesar aunque esten en _processed_files.json
+    # Llamadas en paralelo solo para este job; si no se envia, usa OSC_MAX_WORKERS
+    max_workers: Optional[int] = Field(default=None, ge=1, le=64)
 
 
 def read_sr_numbers(csv_path: str) -> list[tuple[str, str]]:
@@ -253,7 +299,13 @@ def read_sr_numbers(csv_path: str) -> list[tuple[str, str]]:
 
 
 def process_input_file(
-    client: OscClient, csv_path: str, output_folder: str, max_workers: int, job_id: str, force: bool = False
+    client: OscClient,
+    csv_path: str,
+    output_folder: str,
+    max_workers: int,
+    job_id: str,
+    force: bool = False,
+    breaker: CircuitBreaker | None = None,
 ) -> dict:
     """Consulta los adjuntos de cada SR del archivo y escribe el CSV de metadatos.
 
@@ -300,22 +352,31 @@ def process_input_file(
             out_fh.flush()
 
         def fetch(pair: tuple[str, str]) -> tuple[tuple[str, str], list[dict]]:
+            # Con el circuito abierto o en apagado, drena la cola sin llamar al API
+            if shutdown_event.is_set() or (breaker and breaker.is_open()):
+                raise CircuitOpen()
             return pair, client.get_attachments(pair[1])
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(fetch, pair): pair for pair in pending}
             for future in as_completed(futures):
-                if shutdown_event.is_set():
+                if shutdown_event.is_set() or (breaker and breaker.is_open()):
                     pool.shutdown(wait=False, cancel_futures=True)
                     break
                 sr_id, reference = futures[future]
                 try:
                     _, items = future.result()
+                except CircuitOpen:
+                    continue  # SR no consultado; queda pendiente para la proxima corrida
                 except Exception as exc:
                     logger.error("Error consultando adjuntos de SR %s: %s", reference, exc)
                     errors.append({"srNumber": reference, "error": str(exc)})
                     jobs.increment(job_id, "sr_errors")
+                    if breaker and is_transient_error(exc):
+                        breaker.record_failure()
                     continue
+                if breaker:
+                    breaker.record_success()
                 rows = []
                 for item in items:
                     row = {SR_ID_COLUMN: sr_id, REFERENCE_COLUMN: reference}
@@ -333,6 +394,10 @@ def process_input_file(
     if shutdown_event.is_set():
         # El checkpoint queda en disco: la proxima corrida retoma los SR faltantes
         raise ShutdownRequested()
+    if breaker and breaker.is_open():
+        raise CircuitOpen(
+            f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)"
+        )
 
     with open(output_path, newline="", encoding="utf-8-sig") as fh:
         attachments = max(sum(1 for _ in fh) - 1, 0)
@@ -368,19 +433,34 @@ def process_input_file(
 
 
 def run_metadata_job(
-    job_id: str, client: OscClient, batch: list[str], output_folder: str, force: bool = False
+    job_id: str,
+    client: OscClient,
+    batch: list[str],
+    output_folder: str,
+    force: bool = False,
+    max_workers: int | None = None,
 ) -> None:
-    max_workers = config.get_max_workers()
+    max_workers = max_workers or config.get_max_workers()
+    breaker = CircuitBreaker(config.get_circuit_threshold())
     results: list[dict] = []
     had_errors = False
     try:
         for index, csv_path in enumerate(batch, start=1):
             file_name = os.path.basename(csv_path)
             try:
-                result = process_input_file(client, csv_path, output_folder, max_workers, job_id, force)
+                result = process_input_file(client, csv_path, output_folder, max_workers, job_id, force, breaker)
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
                 jobs.finish(job_id, "interrupted", result={"results": results})
+                return
+            except CircuitOpen as exc:
+                message = (
+                    f"Circuit breaker abierto en {file_name}: {exc}. El servicio parece caido "
+                    "(mantenimiento?); el avance quedo en el checkpoint. Relance el metodo "
+                    "cuando el servicio se recupere (verifique con GET /health)."
+                )
+                logger.error("Job %s: %s", job_id, message)
+                jobs.finish(job_id, "interrupted", result={"results": results}, error=message)
                 return
             except Exception as exc:
                 result = {"input_file": file_name, "error": str(exc)}
@@ -432,7 +512,8 @@ def get_metadata_attachments(request: MetadataRequest):
     if not os.path.isdir(request.input_folder):
         raise HTTPException(status_code=400, detail=f"La carpeta de entrada no existe: {request.input_folder}")
 
-    client = build_client()
+    effective_workers = request.max_workers or config.get_max_workers()
+    client = build_client(pool_size=effective_workers)
     os.makedirs(request.output_folder, exist_ok=True)
     if request.files:
         # Seleccion explicita: se procesan exactamente esos archivos
@@ -477,7 +558,7 @@ def get_metadata_attachments(request: MetadataRequest):
     )
     start_job_thread(
         run_metadata_job,
-        (job["job_id"], client, batch, request.output_folder, request.force),
+        (job["job_id"], client, batch, request.output_folder, request.force, effective_workers),
     )
     return {
         "job_id": job["job_id"],
@@ -499,6 +580,8 @@ class BinaryRequest(BaseModel):
     batch_size: int = 10  # solo aplica con metadata_folder; 0 = todos
     overwrite: bool = False
     force: bool = False  # true = ignorar _downloaded_files.json
+    # Descargas en paralelo solo para este job; si no se envia, usa OSC_MAX_WORKERS
+    max_workers: Optional[int] = Field(default=None, ge=1, le=64)
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
@@ -508,7 +591,13 @@ class BinaryRequest(BaseModel):
 
 
 def download_metadata_file(
-    client: OscClient, csv_path: str, output_folder: str, overwrite: bool, job_id: str
+    client: OscClient,
+    csv_path: str,
+    output_folder: str,
+    overwrite: bool,
+    job_id: str,
+    max_workers: int | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> dict:
     file_name = os.path.basename(csv_path)
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
@@ -539,6 +628,9 @@ def download_metadata_file(
 
     def download(row: dict) -> None:
         nonlocal skipped, downloaded
+        # Con el circuito abierto o en apagado, drena la cola sin llamar al API
+        if shutdown_event.is_set() or (breaker and breaker.is_open()):
+            raise CircuitOpen()
         target_path = resolve_target_path(row, output_folder, duplicate_keys)
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
         if os.path.exists(target_path) and not overwrite:
@@ -547,28 +639,38 @@ def download_metadata_file(
             jobs.increment(job_id, "skipped_existing")
             return
         client.download_binary(row[HREF_COLUMN].strip(), target_path)
+        if breaker:
+            breaker.record_success()
         with counters_lock:
             downloaded += 1
         jobs.increment(job_id, "downloaded")
 
-    with ThreadPoolExecutor(max_workers=config.get_max_workers()) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers or config.get_max_workers()) as pool:
         futures = {pool.submit(download, row): row for row in entries}
         for future in as_completed(futures):
-            if shutdown_event.is_set():
+            if shutdown_event.is_set() or (breaker and breaker.is_open()):
                 pool.shutdown(wait=False, cancel_futures=True)
                 break
             row = futures[future]
             try:
                 future.result()
+            except CircuitOpen:
+                continue  # descarga no intentada; queda pendiente para la proxima corrida
             except Exception as exc:
                 reference = (row.get(REFERENCE_COLUMN) or "").strip()
                 logger.error("Error descargando adjunto de SR %s (%s): %s", reference, row.get("FileName"), exc)
                 errors.append({"srNumber": reference, "fileName": row.get("FileName"), "error": str(exc)})
                 jobs.increment(job_id, "download_errors")
+                if breaker and is_transient_error(exc):
+                    breaker.record_failure()
 
     if shutdown_event.is_set():
         # Los archivos ya descargados se omiten en la proxima corrida
         raise ShutdownRequested()
+    if breaker and breaker.is_open():
+        raise CircuitOpen(
+            f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)"
+        )
 
     # Verificacion: cada adjunto esperado debe existir fisicamente en disco
     missing = [
@@ -606,17 +708,30 @@ def run_binary_job(
     output_folder: str,
     overwrite: bool,
     track_state: bool,
+    max_workers: int | None = None,
 ) -> None:
+    breaker = CircuitBreaker(config.get_circuit_threshold())
     results: list[dict] = []
     had_errors = False
     try:
         for index, csv_path in enumerate(batch, start=1):
             file_name = os.path.basename(csv_path)
             try:
-                result = download_metadata_file(client, csv_path, output_folder, overwrite, job_id)
+                result = download_metadata_file(
+                    client, csv_path, output_folder, overwrite, job_id, max_workers, breaker
+                )
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
                 jobs.finish(job_id, "interrupted", result={"results": results})
+                return
+            except CircuitOpen as exc:
+                message = (
+                    f"Circuit breaker abierto en {file_name}: {exc}. El servicio parece caido "
+                    "(mantenimiento?); lo ya descargado queda en disco. Relance el metodo "
+                    "cuando el servicio se recupere (verifique con GET /health)."
+                )
+                logger.error("Job %s: %s", job_id, message)
+                jobs.finish(job_id, "interrupted", result={"results": results}, error=message)
                 return
             except Exception as exc:
                 result = {"metadata_file": file_name, "error": str(exc)}
@@ -662,7 +777,8 @@ def run_binary_job(
 
 @app.post("/GetAttachmentBinary")
 def get_attachment_binary(request: BinaryRequest):
-    client = build_client()
+    effective_workers = request.max_workers or config.get_max_workers()
+    client = build_client(pool_size=effective_workers)
     os.makedirs(request.output_folder, exist_ok=True)
     if request.metadata_csv:
         if not os.path.isfile(request.metadata_csv):
@@ -707,7 +823,7 @@ def get_attachment_binary(request: BinaryRequest):
     )
     start_job_thread(
         run_binary_job,
-        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state),
+        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state, effective_workers),
     )
     return {
         "job_id": job["job_id"],
@@ -716,6 +832,38 @@ def get_attachment_binary(request: BinaryRequest):
         "pending_after_batch": pending_after,
         "status_url": f"/jobs/{job['job_id']}",
     }
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    """Verifica con una llamada minima si el API de Oracle responde.
+
+    Util para saber si un mantenimiento termino antes de relanzar los jobs.
+    No usa reintentos: responde rapido con el estado actual del servicio.
+    """
+    client = build_client()
+    start = time.monotonic()
+    try:
+        response = client.session.get(
+            f"{client.base_url}/serviceRequests",
+            params={"limit": 1, "fields": "SrNumber", "onlyData": "true"},
+            timeout=15,
+        )
+        return {
+            "oracle_ok": response.status_code == 200,
+            "status_code": response.status_code,
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+        }
+    except requests.RequestException as exc:
+        return {
+            "oracle_ok": False,
+            "error": str(exc),
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+        }
 
 
 # ---------------------------------------------------------------------------

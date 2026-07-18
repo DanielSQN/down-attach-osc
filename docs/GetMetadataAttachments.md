@@ -19,6 +19,7 @@ Es **asíncrono**: responde de inmediato con un `job_id`; el avance y el resulta
 | `files` | array de string | No | `null` | Nombres de archivos específicos (dentro de `input_folder`) a procesar, p. ej. `["ServiceRequest_1_1_001.csv"]`. Si se envía, se procesan exactamente esos e **ignora** `batch_size` y el manifiesto. Si alguno no existe, responde 400. |
 | `batch_size` | entero | No | `10` | Máximo de archivos **pendientes** a tomar en esta llamada. `0` = todos los pendientes. Solo aplica cuando no se envía `files`. |
 | `force` | booleano | No | `false` | `true` = ignora el manifiesto y el checkpoint: reprocesa desde cero (borra el CSV de salida y el `.progress` de cada archivo del lote). |
+| `max_workers` | entero (1–64) | No | `OSC_MAX_WORKERS` | Llamadas en paralelo al API solo para este job, sin editar el `.env`. |
 
 ### Ejemplo
 

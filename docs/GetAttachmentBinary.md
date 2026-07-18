@@ -22,6 +22,7 @@ Debe enviarse **exactamente uno** de `metadata_csv` o `metadata_folder`.
 | `batch_size` | entero | No | `10` | Máximo de CSVs de metadatos pendientes a tomar. `0` = todos. Solo aplica con `metadata_folder`. |
 | `overwrite` | booleano | No | `false` | `true` = volver a descargar y sobrescribir binarios que ya existen en disco. Con `false` se omiten (`skipped_existing`), lo que hace baratos los reintentos. |
 | `force` | booleano | No | `false` | `true` = ignorar el manifiesto `_downloaded_files.json` y volver a tomar todos los CSVs de la carpeta. Solo aplica con `metadata_folder`. |
+| `max_workers` | entero (1–64) | No | `OSC_MAX_WORKERS` | Descargas en paralelo solo para este job, sin editar el `.env`. |
 
 ### Ejemplo
 

@@ -47,3 +47,8 @@ def get_max_retries() -> int:
 
 def get_retry_backoff() -> float:
     return float(os.getenv("OSC_RETRY_BACKOFF", "1.0"))
+
+
+def get_circuit_threshold() -> int:
+    """Fallos transitorios consecutivos que abren el circuit breaker (0 = desactivado)."""
+    return int(os.getenv("OSC_CIRCUIT_THRESHOLD", "10"))
