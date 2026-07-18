@@ -152,6 +152,9 @@ def build_client() -> OscClient:
             username=config.get_username(),
             password=config.get_password(),
             timeout=config.get_timeout(),
+            max_retries=config.get_max_retries(),
+            backoff=config.get_retry_backoff(),
+            abort_event=shutdown_event,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))

@@ -39,3 +39,11 @@ def get_timeout() -> int:
 
 def get_error_log_file() -> str:
     return os.getenv("ERROR_LOG_FILE", "errors.log")
+
+
+def get_max_retries() -> int:
+    return int(os.getenv("OSC_MAX_RETRIES", "4"))
+
+
+def get_retry_backoff() -> float:
+    return float(os.getenv("OSC_RETRY_BACKOFF", "1.0"))
