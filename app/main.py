@@ -13,6 +13,8 @@ job_id; el avance y el resultado se consultan en GET /jobs/{job_id}.
   Registro equivalente en _downloaded_files.json.
 """
 
+import base64
+import binascii
 import csv
 import json
 import logging
@@ -130,6 +132,28 @@ OUTPUT_COLUMNS = [SR_ID_COLUMN, REFERENCE_COLUMN, *METADATA_FIELDS, HREF_COLUMN]
 
 METADATA_STATE_FILE = "_processed_files.json"
 BINARY_STATE_FILE = "_downloaded_files.json"
+CLOB_MESSAGES_STATE_FILE = "_processed_clob_messages.json"
+
+# GetMetadataClobAndMessages: campos CLOB (base64 -> texto) y campos de mensajes
+CLOB_FIELDS = ["arin_comentarios_cifrado_c", "col_tex_plantilla_c"]
+CLOB_OUTPUT_COLUMNS = [REFERENCE_COLUMN, *CLOB_FIELDS]
+MESSAGE_FIELDS = [
+    "MessageId",
+    "CreationDate",
+    "CreatedBy",
+    "SrId",
+    "SrNumber",
+    "MessageTypeCd",
+    "ChannelTypeCd",
+    "ChannelId",
+    "StatusCd",
+    "ProcessingStatusCd",
+    "NotificationProcessingStatusCd",
+    "TemplateName",
+]
+MESSAGE_CONTENT_COLUMN = "MessageContent"  # ruta al archivo HTML guardado
+MESSAGE_OUTPUT_COLUMNS = [*MESSAGE_FIELDS, MESSAGE_CONTENT_COLUMN]
+MESSAGE_CONTENT_DIR = "message_content"  # subcarpeta de HTMLs, por SR
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -206,6 +230,21 @@ def build_client(pool_size: int = 10) -> OscClient:
 
 def sanitize_filename(name: str) -> str:
     return INVALID_FILENAME_CHARS.sub("_", name).strip() or "sin_nombre"
+
+
+def decode_clob(value) -> str:
+    """Decodifica un campo CLOB base64 a texto UTF-8.
+
+    Los campos arin_comentarios_cifrado_c / col_tex_plantilla_c vienen en
+    base64 (texto plano, no cifrado). Si el valor es null o no es base64
+    valido, se devuelve tal cual para no perder informacion.
+    """
+    if not value:
+        return ""
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8", errors="replace")
+    except (binascii.Error, ValueError):
+        return str(value)
 
 
 def attachment_base_name(row: dict) -> str:
@@ -824,6 +863,304 @@ def get_attachment_binary(request: BinaryRequest):
     start_job_thread(
         run_binary_job,
         (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state, effective_workers),
+    )
+    return {
+        "job_id": job["job_id"],
+        "status": "running",
+        "files_in_batch": [os.path.basename(f) for f in batch],
+        "pending_after_batch": pending_after,
+        "status_url": f"/jobs/{job['job_id']}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# GetMetadataClobAndMessages
+# ---------------------------------------------------------------------------
+
+class ClobMessagesRequest(BaseModel):
+    input_folder: str
+    output_folder: str
+    files: Optional[list[str]] = None
+    batch_size: int = 10
+    force: bool = False
+    max_workers: Optional[int] = Field(default=None, ge=1, le=64)
+    overwrite_html: bool = False  # true = volver a descargar HTMLs ya existentes
+
+
+def process_clob_messages_file(
+    client: OscClient,
+    csv_path: str,
+    output_folder: str,
+    max_workers: int,
+    job_id: str,
+    force: bool,
+    overwrite_html: bool,
+    breaker: CircuitBreaker | None = None,
+) -> dict:
+    """Por cada SR: consulta CLOB + messages, escribe 2 CSV y baja los HTML.
+
+    Escritura incremental con checkpoint por SR (igual que metadata): si se
+    corta, la proxima corrida retoma solo los SR faltantes.
+    """
+    file_name = os.path.basename(csv_path)
+    pairs = read_sr_numbers(csv_path)
+    base = os.path.splitext(file_name)[0]
+    clob_path = os.path.join(output_folder, f"{base}_clob.csv")
+    messages_path = os.path.join(output_folder, f"{base}_messages.csv")
+    progress_path = messages_path + ".progress"
+    html_root = os.path.join(output_folder, MESSAGE_CONTENT_DIR)
+
+    done: set[str] = set()
+    if force:
+        for path in (clob_path, messages_path, progress_path):
+            if os.path.exists(path):
+                os.remove(path)
+    elif os.path.isfile(progress_path) and os.path.isfile(messages_path):
+        with open(progress_path, encoding="utf-8") as fh:
+            done = {line.strip() for line in fh if line.strip()}
+
+    pending = [pair for pair in pairs if pair[1] not in done]
+    resuming = bool(done)
+    logger.info(
+        "Procesando clob+messages %s (%d SR, %d ya hechos, %d pendientes)",
+        file_name, len(pairs), len(pairs) - len(pending), len(pending),
+    )
+    jobs.set_progress(
+        job_id, current_file=file_name, current_file_srs=len(pairs), current_file_pending=len(pending)
+    )
+
+    errors: list[dict] = []
+    write_lock = threading.Lock()
+    message_count = 0
+
+    def process_sr(pair: tuple[str, str]):
+        sr_id, sr = pair
+        if shutdown_event.is_set() or (breaker and breaker.is_open()):
+            raise CircuitOpen()
+        data = client.get_sr_fields(sr, [*CLOB_FIELDS, "messages"])
+        clob_row = {
+            REFERENCE_COLUMN: sr,
+            CLOB_FIELDS[0]: decode_clob(data.get(CLOB_FIELDS[0])),
+            CLOB_FIELDS[1]: decode_clob(data.get(CLOB_FIELDS[1])),
+        }
+        message_rows: list[dict] = []
+        for msg in data.get("messages") or []:
+            row = {field: msg.get(field, "") for field in MESSAGE_FIELDS}
+            message_id = str(msg.get("MessageId", "")).strip()
+            if message_id:
+                sr_dir = os.path.join(html_root, sanitize_filename(sr))
+                os.makedirs(sr_dir, exist_ok=True)
+                html_path = os.path.join(sr_dir, f"{sanitize_filename(message_id)}.html")
+                if not (os.path.exists(html_path) and not overwrite_html):
+                    client.download_binary(client.message_content_url(sr, message_id), html_path)
+                row[MESSAGE_CONTENT_COLUMN] = os.path.relpath(html_path, output_folder)
+            else:
+                row[MESSAGE_CONTENT_COLUMN] = ""
+            message_rows.append(row)
+        return pair, clob_row, message_rows
+
+    with open(clob_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as clob_fh, \
+            open(messages_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as msg_fh, \
+            open(progress_path, "a" if resuming else "w", encoding="utf-8") as prog_fh:
+        clob_writer = csv.DictWriter(clob_fh, fieldnames=CLOB_OUTPUT_COLUMNS)
+        msg_writer = csv.DictWriter(msg_fh, fieldnames=MESSAGE_OUTPUT_COLUMNS)
+        if not resuming:
+            clob_writer.writeheader()
+            msg_writer.writeheader()
+            clob_fh.flush()
+            msg_fh.flush()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(process_sr, pair): pair for pair in pending}
+            for future in as_completed(futures):
+                if shutdown_event.is_set() or (breaker and breaker.is_open()):
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                sr_id, sr = futures[future]
+                try:
+                    _, clob_row, message_rows = future.result()
+                except CircuitOpen:
+                    continue
+                except Exception as exc:
+                    logger.error("Error consultando clob/messages de SR %s: %s", sr, exc)
+                    errors.append({"srNumber": sr, "error": str(exc)})
+                    jobs.increment(job_id, "sr_errors")
+                    if breaker and is_transient_error(exc):
+                        breaker.record_failure()
+                    continue
+                if breaker:
+                    breaker.record_success()
+                with write_lock:
+                    clob_writer.writerow(clob_row)
+                    clob_fh.flush()
+                    if message_rows:
+                        msg_writer.writerows(message_rows)
+                        msg_fh.flush()
+                    prog_fh.write(sr + "\n")
+                    prog_fh.flush()
+                    message_count += len(message_rows)
+                jobs.increment(job_id, "srs_consulted")
+
+    if shutdown_event.is_set():
+        raise ShutdownRequested()
+    if breaker and breaker.is_open():
+        raise CircuitOpen(f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)")
+
+    if not errors:
+        os.remove(progress_path)
+
+    consulted = len(pairs) - len(errors)
+    verification = {
+        "expected_srs": len(pairs),
+        "consulted": consulted,
+        "failed": len(errors),
+        "ok": len(errors) == 0,
+    }
+    if errors:
+        logger.error(
+            "Verificacion %s: %d de %d SR fallaron y quedan pendientes de reintento",
+            file_name, len(errors), len(pairs),
+        )
+
+    logger.info("Generado %s_clob.csv y %s_messages.csv (%d mensajes, %d errores)",
+                base, base, message_count, len(errors))
+    return {
+        "input_file": file_name,
+        "clob_file": clob_path,
+        "messages_file": messages_path,
+        "service_requests": len(pairs),
+        "resumed_srs": len(pairs) - len(pending),
+        "messages": message_count,
+        "errors": errors,
+        "verification": verification,
+    }
+
+
+def run_clob_messages_job(
+    job_id: str,
+    client: OscClient,
+    batch: list[str],
+    output_folder: str,
+    force: bool,
+    max_workers: int | None,
+    overwrite_html: bool,
+) -> None:
+    max_workers = max_workers or config.get_max_workers()
+    breaker = CircuitBreaker(config.get_circuit_threshold())
+    results: list[dict] = []
+    had_errors = False
+    try:
+        for index, csv_path in enumerate(batch, start=1):
+            file_name = os.path.basename(csv_path)
+            try:
+                result = process_clob_messages_file(
+                    client, csv_path, output_folder, max_workers, job_id, force, overwrite_html, breaker
+                )
+            except ShutdownRequested:
+                logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
+                jobs.finish(job_id, "interrupted", result={"results": results})
+                return
+            except CircuitOpen as exc:
+                message = (
+                    f"Circuit breaker abierto en {file_name}: {exc}. El servicio parece caido "
+                    "(mantenimiento?); el avance quedo en el checkpoint. Relance el metodo "
+                    "cuando el servicio se recupere (verifique con GET /health)."
+                )
+                logger.error("Job %s: %s", job_id, message)
+                jobs.finish(job_id, "interrupted", result={"results": results}, error=message)
+                return
+            except Exception as exc:
+                result = {"input_file": file_name, "error": str(exc)}
+            finally:
+                release_file(output_folder, CLOB_MESSAGES_STATE_FILE, file_name)
+            results.append(result)
+
+            file_failed = "error" in result or bool(result.get("errors"))
+            had_errors = had_errors or file_failed
+            if not file_failed:
+                mark_processed(
+                    output_folder,
+                    CLOB_MESSAGES_STATE_FILE,
+                    file_name,
+                    {
+                        "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "job_id": job_id,
+                        "clob_file": result["clob_file"],
+                        "messages_file": result["messages_file"],
+                        "service_requests": result["service_requests"],
+                        "messages": result["messages"],
+                    },
+                )
+            jobs.set_progress(job_id, processed_files=index, current_file=None)
+        summary = {
+            "files": len(results),
+            "expected_srs": sum(r.get("service_requests", 0) for r in results),
+            "consulted": sum(r.get("verification", {}).get("consulted", 0) for r in results),
+            "failed_srs": sum(len(r.get("errors", [])) for r in results),
+            "messages": sum(r.get("messages", 0) for r in results),
+            "all_ok": all(r.get("verification", {}).get("ok", False) for r in results),
+        }
+        jobs.finish(
+            job_id,
+            "completed_with_errors" if had_errors else "completed",
+            result={"summary": summary, "results": results},
+        )
+    except Exception as exc:
+        logger.exception("Job %s fallo", job_id)
+        jobs.finish(job_id, "failed", error=str(exc))
+    finally:
+        for csv_path in batch:
+            release_file(output_folder, CLOB_MESSAGES_STATE_FILE, os.path.basename(csv_path))
+
+
+@app.post("/GetMetadataClobAndMessages")
+def get_metadata_clob_and_messages(request: ClobMessagesRequest):
+    if not os.path.isdir(request.input_folder):
+        raise HTTPException(status_code=400, detail=f"La carpeta de entrada no existe: {request.input_folder}")
+
+    effective_workers = request.max_workers or config.get_max_workers()
+    client = build_client(pool_size=effective_workers)
+    os.makedirs(request.output_folder, exist_ok=True)
+    if request.files:
+        batch = [os.path.join(request.input_folder, name) for name in request.files]
+        missing = [name for name, path in zip(request.files, batch) if not os.path.isfile(path)]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Archivos no encontrados en {request.input_folder}: {', '.join(missing)}",
+            )
+        busy = reserve_explicit(batch, request.output_folder, CLOB_MESSAGES_STATE_FILE)
+        if busy:
+            raise HTTPException(status_code=409, detail=f"Archivos en proceso por otro job: {', '.join(busy)}")
+        pending_after = 0
+    else:
+        input_files = list_csv_files(request.input_folder)
+        if not input_files:
+            raise HTTPException(status_code=400, detail="La carpeta de entrada no contiene archivos .csv")
+        state = {} if request.force else load_state(request.output_folder, CLOB_MESSAGES_STATE_FILE)
+        batch, pending_after = reserve_batch(
+            input_files, request.output_folder, CLOB_MESSAGES_STATE_FILE, state, request.batch_size
+        )
+        if not batch:
+            return {
+                "job_id": None,
+                "message": "No hay archivos pendientes: todos estan registrados en "
+                f"{CLOB_MESSAGES_STATE_FILE} o en proceso por otro job (use force=true para reprocesar)",
+                "total_files": len(input_files),
+            }
+
+    job = jobs.create("GetMetadataClobAndMessages", request.model_dump())
+    jobs.set_progress(
+        job["job_id"],
+        total_files=len(batch),
+        processed_files=0,
+        pending_after_batch=pending_after,
+        srs_consulted=0,
+        sr_errors=0,
+    )
+    start_job_thread(
+        run_clob_messages_job,
+        (job["job_id"], client, batch, request.output_folder, request.force, effective_workers, request.overwrite_html),
     )
     return {
         "job_id": job["job_id"],
