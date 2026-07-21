@@ -8,6 +8,7 @@ Los dos métodos son **asíncronos**: encolan un job en segundo plano y devuelve
 |---|---|
 | `POST /GetMetadataAttachments` | Toma un **lote** (`batch_size`, por defecto 10) de archivos `ServiceRequest_X_Y_00Z.csv` aún no procesados de la carpeta de entrada (columnas `"Service Request ID","Reference Number"`), consulta los adjuntos de cada `Reference Number` (paginación por `offset` mientras `hasMore` sea `true`) y genera **un CSV de metadatos por archivo de entrada** con todas las columnas de metadatos más el `href` del enclosure `FileContents`. |
 | `POST /GetAttachmentBinary` | Toma un CSV de metadatos (`metadata_csv`) o un **lote** de una carpeta de CSVs de metadatos (`metadata_folder`) y, por cada fila, descarga el binario desde el `href` de `FileContents`, guardándolo con el nombre del `FileName` en una subcarpeta por SR. |
+| `POST /GetMetadataClobAndMessages` | Por cada SR consulta los campos CLOB (`arin_comentarios_cifrado_c`, `col_tex_plantilla_c`, decodificados de base64 a texto) y el array `messages`; genera un CSV de CLOB y un CSV de mensajes por archivo de entrada, y guarda el HTML de cada mensaje como archivo. |
 | `GET /jobs/{job_id}` | Estatus y avance de un job (`running`, `completed`, `completed_with_errors`, `failed`, `interrupted`). |
 | `GET /jobs` | Lista de los últimos jobs. |
 | `GET /health` | Verifica con una llamada mínima si el API de Oracle responde (útil para saber si un mantenimiento terminó antes de relanzar). |
@@ -17,6 +18,7 @@ Especificación campo a campo de cada método (petición, respuesta, errores y a
 
 - [docs/GetMetadataAttachments.md](docs/GetMetadataAttachments.md)
 - [docs/GetAttachmentBinary.md](docs/GetAttachmentBinary.md)
+- [docs/GetMetadataClobAndMessages.md](docs/GetMetadataClobAndMessages.md)
 - [docs/Jobs.md](docs/Jobs.md)
 - [docs/ValidarReferenceNumber.md](docs/ValidarReferenceNumber.md) — cómo validar desde Windows si un Reference Number quedó en los archivos de metadata
 

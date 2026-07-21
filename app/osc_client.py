@@ -109,6 +109,24 @@ class OscClient:
     # Operaciones de negocio
     # ------------------------------------------------------------------
 
+    def get_sr_fields(self, sr_number: str, fields: list[str]) -> dict:
+        """Consulta campos puntuales de una solicitud (?fields=...&onlyData=true).
+
+        Devuelve el objeto de la solicitud con esos campos (p. ej. los CLOB
+        arin_comentarios_cifrado_c, col_tex_plantilla_c y el array messages).
+        """
+        url = f"{self.base_url}/serviceRequests/{sr_number}"
+        params = {"fields": ",".join(fields), "onlyData": "true"}
+        response = self._get_with_retry(url, params=params)
+        return response.json()
+
+    def message_content_url(self, sr_number: str, message_id: str) -> str:
+        """URL del enclosure con el HTML del contenido de un mensaje."""
+        return (
+            f"{self.base_url}/serviceRequests/{sr_number}"
+            f"/child/messages/{message_id}/enclosure/MessageContent"
+        )
+
     def get_attachments(self, sr_number: str) -> list[dict]:
         """Devuelve todos los adjuntos de una solicitud, paginando con offset.
 
