@@ -18,6 +18,7 @@ Especificación campo a campo de cada método (petición, respuesta, errores y a
 - [docs/GetMetadataAttachments.md](docs/GetMetadataAttachments.md)
 - [docs/GetAttachmentBinary.md](docs/GetAttachmentBinary.md)
 - [docs/Jobs.md](docs/Jobs.md)
+- [docs/ValidarReferenceNumber.md](docs/ValidarReferenceNumber.md) — cómo validar desde Windows si un Reference Number quedó en los archivos de metadata
 
 ## Estrategia de lotes y reanudación
 
