@@ -867,6 +867,31 @@ def health():
 
 
 # ---------------------------------------------------------------------------
+# Consulta puntual de un SR (validaciones ad-hoc)
+# ---------------------------------------------------------------------------
+
+@app.get("/attachments/{sr_number}")
+def get_attachments_by_sr(sr_number: str):
+    """Consulta en vivo los adjuntos de un Reference Number, sin archivos.
+
+    Pensado para validaciones puntuales: se envia el srNumber directamente y
+    devuelve los mismos campos que el CSV de metadatos mas el FileContentsHref.
+    No hace falta saber en que archivo esta el SR.
+    """
+    client = build_client()
+    try:
+        items = client.get_attachments(sr_number)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Error consultando SR {sr_number}: {exc}")
+    attachments = []
+    for item in items:
+        row = {field: item.get(field, "") for field in METADATA_FIELDS}
+        row[HREF_COLUMN] = get_file_contents_href(item)
+        attachments.append(row)
+    return {"srNumber": sr_number, "count": len(attachments), "attachments": attachments}
+
+
+# ---------------------------------------------------------------------------
 # Consulta de jobs
 # ---------------------------------------------------------------------------
 
