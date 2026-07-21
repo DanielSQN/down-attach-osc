@@ -149,38 +149,3 @@ Hace una llamada mínima al API de Oracle (1 registro, solo el campo `SrNumber`)
 # Esperar a que Oracle vuelva de mantenimiento (revisa cada 60 s):
 while (-not (Invoke-RestMethod http://127.0.0.1:8000/health).oracle_ok) { Start-Sleep 60 }
 ```
-
----
-
-## GET /attachments/{srNumber}
-
-Consulta **en vivo** los adjuntos de un Reference Number puntual, directamente contra Oracle, sin leer ni escribir archivos. Pensado para validaciones ad-hoc: no hace falta saber en qué archivo de entrada está el SR.
-
-- **URL**: `http://<host>:8000/attachments/{srNumber}`
-- **Método**: `GET`
-
-### Parámetros de ruta
-
-| Campo | Tipo | Requerido | Descripción |
-|---|---|---|---|
-| `srNumber` | string | Sí | El Reference Number a consultar (p. ej. `0002859140`). |
-
-### Respuesta (200)
-
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `srNumber` | string | El SR consultado. |
-| `count` | entero | Cantidad de adjuntos (`0` si el SR no tiene adjuntos). |
-| `attachments` | array | Un objeto por adjunto con los mismos campos del CSV de metadatos (`AttachedDocumentId`, `DatatypeCode`, `FileName`, `DmDocumentId`, `UploadedFileContentType`, `UploadedFileLength`, `Title`, `CreationDate`, `CreatedBy`) más `FileContentsHref`. |
-
-### Errores
-
-| Código | Causa |
-|---|---|
-| `502` | La consulta a Oracle falló (tras agotar reintentos). El detalle viene en `detail`. |
-| `500` | Falta alguna variable en el `.env`. |
-
-```powershell
-# Validación puntual de un SR:
-Invoke-RestMethod http://127.0.0.1:8000/attachments/0002859140 | ConvertTo-Json -Depth 5
-```
