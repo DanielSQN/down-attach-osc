@@ -148,13 +148,13 @@ class OscClient:
             offset += len(page_items) if page_items else data.get("limit", 25)
         return items
 
-    def download_binary(self, href: str, target_path: str) -> None:
-        """Descarga el binario del enclosure FileContents a target_path.
+    def stream_binary(self, href: str, sink) -> None:
+        """Trae el binario del enclosure y se lo pasa a `sink(response)`.
 
         Se sobreescribe el Accept de la sesion (application/json) porque el
         enclosure devuelve un binario y Oracle responde 406 si se pide JSON.
-        Se reintenta ante errores transitorios; cada intento reescribe el
-        archivo desde cero para no dejar descargas parciales.
+        Se reintenta ante errores transitorios; cada intento reabre el stream
+        desde cero (el sink debe reescribir el destino, no anexar).
         """
         headers = {"Accept": "*/*"}
         last_exc: Exception | None = None
@@ -171,9 +171,7 @@ class OscClient:
                         )
                     else:
                         response.raise_for_status()
-                        with open(target_path, "wb") as fh:
-                            for chunk in response.iter_content(chunk_size=1024 * 256):
-                                fh.write(chunk)
+                        sink(response)
                         return
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
@@ -184,6 +182,14 @@ class OscClient:
                 )
                 self._sleep_backoff(attempt, retry_after)
         raise last_exc
+
+    def download_binary(self, href: str, target_path: str) -> None:
+        """Descarga el binario del enclosure FileContents a un archivo local."""
+        def to_file(response) -> None:
+            with open(target_path, "wb") as fh:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    fh.write(chunk)
+        self.stream_binary(href, to_file)
 
 
 def get_file_contents_href(item: dict) -> str:

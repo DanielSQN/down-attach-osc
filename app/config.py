@@ -52,3 +52,8 @@ def get_retry_backoff() -> float:
 def get_circuit_threshold() -> int:
     """Fallos transitorios consecutivos que abren el circuit breaker (0 = desactivado)."""
     return int(os.getenv("OSC_CIRCUIT_THRESHOLD", "10"))
+
+
+def get_gcp_service_account_file() -> str:
+    """Ruta al JSON de la cuenta de servicio de GCP (vacio = credenciales por defecto)."""
+    return os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip()
