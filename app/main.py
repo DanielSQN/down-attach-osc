@@ -657,7 +657,7 @@ class BinaryRequest(BaseModel):
         return self
 
 
-def build_storage(request: "BinaryRequest"):
+def build_storage(request: "BinaryRequest", pool_size: int = 10):
     """Crea el backend de almacenamiento segun destination (valida credenciales)."""
     if request.destination == "gcp":
         try:
@@ -665,6 +665,7 @@ def build_storage(request: "BinaryRequest"):
                 bucket=request.gcp_bucket,
                 prefix=request.gcp_prefix,
                 credentials_file=config.get_gcp_service_account_file(),
+                pool_size=pool_size,
             )
         except ImportError:
             raise HTTPException(
@@ -989,7 +990,7 @@ def get_attachment_binary(request: BinaryRequest):
     effective_workers = request.max_workers or config.get_max_workers()
     client = build_client(pool_size=effective_workers)
     os.makedirs(request.output_folder, exist_ok=True)
-    storage = build_storage(request)  # valida credenciales/bucket antes de encolar
+    storage = build_storage(request, pool_size=effective_workers)  # valida credenciales/bucket antes de encolar
     if request.metadata_csv:
         if not os.path.isfile(request.metadata_csv):
             raise HTTPException(status_code=400, detail=f"El archivo de metadatos no existe: {request.metadata_csv}")
