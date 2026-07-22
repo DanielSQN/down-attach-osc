@@ -86,7 +86,9 @@ class OscClient:
             retry_after = None
             try:
                 response = self.session.get(url, timeout=self.timeout, **kwargs)
-            except (requests.ConnectionError, requests.Timeout) as exc:
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as exc:
+                # ChunkedEncodingError = "Response ended prematurely" (conexion
+                # cortada a mitad del stream): transitorio, se reintenta.
                 last_exc = exc
             else:
                 if response.status_code not in RETRYABLE_STATUS:
@@ -173,7 +175,9 @@ class OscClient:
                         response.raise_for_status()
                         sink(response)
                         return
-            except (requests.ConnectionError, requests.Timeout) as exc:
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as exc:
+                # ChunkedEncodingError = "Response ended prematurely" (conexion
+                # cortada a mitad del stream): transitorio, se reintenta.
                 last_exc = exc
             if attempt < self.max_retries:
                 logger.warning(

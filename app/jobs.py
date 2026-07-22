@@ -5,10 +5,14 @@ consultar incluso despues de reiniciar el servidor.
 """
 
 import json
+import logging
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -27,10 +31,29 @@ class JobManager:
 
     def _persist(self, job: dict) -> None:
         os.makedirs(self.jobs_dir, exist_ok=True)
-        tmp = self._path(job["job_id"]) + ".tmp"
+        path = self._path(job["job_id"])
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(job, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, self._path(job["job_id"]))
+        # En Windows os.replace falla con "Acceso denegado" (WinError 5) si el
+        # destino .json esta abierto por otro hilo (un GET /jobs concurrente) o
+        # por el antivirus. Se reintenta unas veces; si aun asi falla, se registra
+        # y NO se propaga: persistir el estado es bookkeeping y jamas debe marcar
+        # una descarga como fallida.
+        for _ in range(10):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.05)
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("No se pudo persistir el job %s: %s", job.get("job_id"), exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def create(self, job_type: str, params: dict) -> dict:
         job = {
