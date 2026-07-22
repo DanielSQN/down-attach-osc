@@ -38,6 +38,8 @@ GCP_SERVICE_ACCOUNT_FILE=C:\\ruta\\cuenta-servicio.json
 Si se deja vacío, usa las credenciales por defecto de GCP (ADC / `GOOGLE_APPLICATION_CREDENTIALS`). El `output_folder` sigue siendo obligatorio: ahí viven el manifiesto `_downloaded_files.json` y los checkpoints (los binarios NO se guardan en local). Para la reanudación, al iniciar cada archivo se lista una vez el prefijo del bucket y se omiten los objetos ya presentes (`skipped_existing`).
 
 > Requiere la dependencia `google-cloud-storage` (incluida en `requirements.txt`). Si falta, `destination=gcp` responde 500.
+>
+> **Detalle completo de la conexión a GCP** (crear la cuenta de servicio, estructura del JSON, permisos del bucket, red/proxy y cómo probar): ver [GCP_CuentaDeServicio.md](GCP_CuentaDeServicio.md).
 
 ### Ejemplo
 
