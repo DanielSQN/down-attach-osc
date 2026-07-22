@@ -1244,6 +1244,47 @@ def health():
         }
 
 
+@app.get("/health/gcp")
+def health_gcp(bucket: str, prefix: str = "", write_test: bool = True):
+    """Verifica la conexion a un bucket de GCP con la cuenta de servicio.
+
+    Prueba autenticacion + listar y, si write_test, sube y borra un objeto de
+    prueba. Util para validar credenciales/permisos/red antes de un job grande.
+    """
+    start = time.monotonic()
+    creds = "service_account_file" if config.get_gcp_service_account_file() else "default"
+    try:
+        storage = GcpStorage(
+            bucket=bucket, prefix=prefix, credentials_file=config.get_gcp_service_account_file()
+        )
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="Falta la dependencia google-cloud-storage (pip install -r requirements.txt)",
+        )
+    except Exception as exc:
+        return {
+            "gcp_ok": False,
+            "bucket": bucket,
+            "credentials": creds,
+            "error": f"No se pudo inicializar GCP: {exc}",
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+        }
+    result = storage.check(write_test=write_test)
+    checks = result["checks"]
+    # El job necesita listar y subir; borrar no es requerido
+    gcp_ok = checks["auth_list"] and checks["write"] in (True, None)
+    return {
+        "gcp_ok": gcp_ok,
+        "bucket": bucket,
+        "prefix": prefix,
+        "credentials": creds,
+        "checks": checks,
+        "errors": result["errors"],
+        "elapsed_ms": int((time.monotonic() - start) * 1000),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Consulta puntual de un SR (validaciones ad-hoc)
 # ---------------------------------------------------------------------------

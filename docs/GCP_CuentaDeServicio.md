@@ -115,15 +115,36 @@ Si el firewall bloquea Google, el job fallará con errores de conexión (que ade
 
 ## 8. Probar la conexión ANTES de un job grande
 
-Con el entorno virtual activado, una prueba mínima que sube y lista un objeto de prueba (reemplazá la ruta y el bucket):
+### Opción A (recomendada): endpoint `GET /health/gcp`
+
+Con el API corriendo, desde el navegador/Swagger o PowerShell (reemplazá el bucket):
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/health/gcp?bucket=mi-bucket&prefix=adjuntos"
+```
+
+Prueba autenticación + listar y, por defecto, sube y borra un objeto de prueba (`write_test=false` para omitir la escritura). Respuesta:
+
+| Campo | Descripción |
+|---|---|
+| `gcp_ok` | `true` si la cuenta puede listar y subir (lo que el job necesita). |
+| `credentials` | `service_account_file` (usó el JSON) o `default` (ADC). |
+| `checks` | `{ auth_list, write, delete }` — qué verificaciones pasaron (`delete` puede ser `false` sin invalidar: el job no borra). |
+| `errors` | Detalle del error donde se detuvo (p. ej. `403 storage.objects.create denied` → falta rol en el bucket). |
+| `elapsed_ms` | Duración. |
+
+Ejemplo OK: `{ "gcp_ok": true, "checks": { "auth_list": true, "write": true, "delete": true }, "errors": {} }`.
+
+### Opción B: script directo
+
+Con el entorno virtual activado (reemplazá la ruta y el bucket):
 
 ```powershell
 .\venv\Scripts\Activate.ps1
 python -c "from google.cloud import storage; c = storage.Client.from_service_account_json(r'C:\secrets\osc-gcp-sa.json'); b = c.bucket('mi-bucket'); b.blob('prueba/conexion.txt').upload_from_string('ok'); print('Subida OK'); print('Listar:', [x.name for x in c.list_blobs('mi-bucket', prefix='prueba', max_results=5)])"
 ```
 
-- Imprime `Subida OK` y lista el objeto → credenciales, permisos y red están bien.
-- Si falla, mirá el punto 9.
+Si cualquiera de las dos falla, mirá el punto 9.
 
 ---
 
