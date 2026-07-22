@@ -23,6 +23,21 @@ Debe enviarse **exactamente uno** de `metadata_csv` o `metadata_folder`.
 | `overwrite` | booleano | No | `false` | `true` = volver a descargar y sobrescribir binarios que ya existen en disco. Con `false` se omiten (`skipped_existing`), lo que hace baratos los reintentos. |
 | `force` | booleano | No | `false` | `true` = ignorar el manifiesto `_downloaded_files.json` y volver a tomar todos los CSVs de la carpeta. Solo aplica con `metadata_folder`. |
 | `max_workers` | entero (1–64) | No | `OSC_MAX_WORKERS` | Descargas en paralelo solo para este job, sin editar el `.env`. |
+| `destination` | string | No | `"local"` | Destino de los binarios: `"local"` (guarda en `output_folder`) o `"gcp"` (sube a un bucket de GCP). |
+| `gcp_bucket` | string | Requerido si `destination=gcp` | `null` | Nombre del bucket de GCP destino. |
+| `gcp_prefix` | string | No | `""` | Prefijo (carpeta) dentro del bucket. Los objetos quedan en `<prefix>/<Reference Number>/<FileName>`. |
+
+### Destino GCP
+
+Con `destination: "gcp"` el binario se transmite **directamente desde Oracle al bucket** (sin pasar por disco local). El objeto se nombra igual que en local: `<gcp_prefix>/<Reference Number>/<FileName>` (con el prefijo `DmDocumentId` solo en colisiones). Requiere una **cuenta de servicio** con permiso de escritura en el bucket, configurada en el `.env`:
+
+```ini
+GCP_SERVICE_ACCOUNT_FILE=C:\\ruta\\cuenta-servicio.json
+```
+
+Si se deja vacío, usa las credenciales por defecto de GCP (ADC / `GOOGLE_APPLICATION_CREDENTIALS`). El `output_folder` sigue siendo obligatorio: ahí viven el manifiesto `_downloaded_files.json` y los checkpoints (los binarios NO se guardan en local). Para la reanudación, al iniciar cada archivo se lista una vez el prefijo del bucket y se omiten los objetos ya presentes (`skipped_existing`).
+
+> Requiere la dependencia `google-cloud-storage` (incluida en `requirements.txt`). Si falta, `destination=gcp` responde 500.
 
 ### Ejemplo
 
@@ -64,8 +79,8 @@ Cuando **no** hay CSVs pendientes (solo en modo `metadata_folder`):
 |---|---|
 | `400` | `metadata_csv` no existe; `metadata_folder` no existe o no contiene CSVs. El detalle viene en el campo `detail`. |
 | `409` | El `metadata_csv` pedido está siendo procesado por otro job en este momento. |
-| `422` | Body inválido; o se enviaron ambos (o ninguno) de `metadata_csv` / `metadata_folder`. |
-| `500` | Falta alguna variable en el `.env` (`OSC_DOMAIN`, `OSC_USERNAME`, `OSC_PASSWORD`). |
+| `422` | Body inválido; se enviaron ambos (o ninguno) de `metadata_csv` / `metadata_folder`; o `destination=gcp` sin `gcp_bucket`. |
+| `500` | Falta alguna variable en el `.env` (`OSC_DOMAIN`, `OSC_USERNAME`, `OSC_PASSWORD`); o no se pudo inicializar GCP (credenciales/bucket/dependencia). |
 
 > **Jobs en paralelo**: se pueden lanzar varias llamadas con `metadata_folder` a la vez; cada job reserva sus CSVs al iniciar y los demás toman los siguientes pendientes, sin traslapes.
 
@@ -82,7 +97,8 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed`, `completed_with
 | `downloaded` | entero | Binarios descargados en esta corrida. |
 | `skipped_existing` | entero | Binarios omitidos por ya existir en disco. |
 | `errors` | array | Descargas fallidas: objetos `{ "srNumber": string, "fileName": string, "error": string }`. Se reintentan solos en la siguiente corrida. |
-| `verification` | objeto | Confirmación en disco: `{ "expected", "on_disk", "missing_count", "missing_sample", "ok" }`. Se recalcula qué archivos destino existen físicamente; `ok` es `true` si no falta ninguno. `missing_sample` lista hasta 20 rutas faltantes. |
+| `destination` | string | `"local"` o `"gcp"`, el destino usado. |
+| `verification` | objeto | Confirmación de que cada adjunto quedó guardado: `{ "expected", "stored", "missing_count", "missing_sample", "ok" }`. Una subida/escritura que no lanzó error queda confirmada; `ok` es `true` si no falta ninguno. `missing_sample` lista hasta 20 rutas relativas faltantes. |
 | `error` | string | Solo presente si el CSV completo no se pudo procesar (p. ej. sin columna `FileContentsHref`). |
 
 Además, `result.summary` agrega el total del job: `{ "files", "expected", "downloaded", "skipped_existing", "missing", "all_ok" }`. `all_ok: true` significa que todos los adjuntos esperados quedaron en disco.

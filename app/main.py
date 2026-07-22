@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, model_validator
 from app import config
 from app.jobs import JobManager
 from app.osc_client import METADATA_FIELDS, RETRYABLE_STATUS, OscClient, get_file_contents_href
+from app.storage import GcpStorage, LocalStorage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -261,8 +262,12 @@ def target_subdir(reference: str) -> str:
     return sanitize_filename(reference) or "sin_sr"
 
 
-def resolve_target_path(row: dict, output_folder: str, duplicate_keys: set) -> str:
-    """Ruta destino del binario de una fila; prefija con DmDocumentId solo si choca."""
+def resolve_target_rel(row: dict, duplicate_keys: set) -> str:
+    """Ruta relativa del binario ('subcarpetaSR/nombre'); prefija con DmDocumentId solo si choca.
+
+    Es agnostica del destino: LocalStorage la une a output_folder y GcpStorage
+    la antepone con el prefix del bucket.
+    """
     reference = (row.get(REFERENCE_COLUMN) or "").strip()
     subdir = target_subdir(reference)
     base = sanitize_filename(attachment_base_name(row))
@@ -272,7 +277,7 @@ def resolve_target_path(row: dict, output_folder: str, duplicate_keys: set) -> s
         name = sanitize_filename(f"{prefix}_{attachment_base_name(row)}") if prefix else base
     else:
         name = base
-    return os.path.join(output_folder, subdir, name)
+    return f"{subdir}/{name}"
 
 
 def load_state(folder: str, state_file: str) -> dict:
@@ -615,24 +620,51 @@ def get_metadata_attachments(request: MetadataRequest):
 class BinaryRequest(BaseModel):
     metadata_csv: Optional[str] = None  # un CSV especifico, o...
     metadata_folder: Optional[str] = None  # ...una carpeta de CSVs de metadatos
-    output_folder: str
+    output_folder: str  # binarios (destino local) y siempre el manifiesto/checkpoints
     batch_size: int = 10  # solo aplica con metadata_folder; 0 = todos
     overwrite: bool = False
     force: bool = False  # true = ignorar _downloaded_files.json
     # Descargas en paralelo solo para este job; si no se envia, usa OSC_MAX_WORKERS
     max_workers: Optional[int] = Field(default=None, ge=1, le=64)
+    # Destino de los binarios: "local" (en output_folder) o "gcp" (bucket)
+    destination: str = "local"
+    gcp_bucket: Optional[str] = None  # requerido si destination=gcp
+    gcp_prefix: str = ""  # prefijo opcional dentro del bucket
 
     @model_validator(mode="after")
-    def _exactly_one_source(self):
+    def _validate(self):
         if bool(self.metadata_csv) == bool(self.metadata_folder):
             raise ValueError("Debe indicar metadata_csv o metadata_folder (solo uno)")
+        if self.destination not in ("local", "gcp"):
+            raise ValueError("destination debe ser 'local' o 'gcp'")
+        if self.destination == "gcp" and not self.gcp_bucket:
+            raise ValueError("gcp_bucket es requerido cuando destination='gcp'")
         return self
+
+
+def build_storage(request: "BinaryRequest"):
+    """Crea el backend de almacenamiento segun destination (valida credenciales)."""
+    if request.destination == "gcp":
+        try:
+            return GcpStorage(
+                bucket=request.gcp_bucket,
+                prefix=request.gcp_prefix,
+                credentials_file=config.get_gcp_service_account_file(),
+            )
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="Falta la dependencia google-cloud-storage (pip install -r requirements.txt)",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"No se pudo inicializar GCP: {exc}")
+    return LocalStorage(request.output_folder)
 
 
 def download_metadata_file(
     client: OscClient,
     csv_path: str,
-    output_folder: str,
+    storage,
     overwrite: bool,
     job_id: str,
     max_workers: int | None = None,
@@ -648,8 +680,11 @@ def download_metadata_file(
             )
         entries = [row for row in reader if (row.get(HREF_COLUMN) or "").strip()]
 
-    logger.info("Descargando %s (%d adjuntos)", file_name, len(entries))
+    logger.info("Descargando %s (%d adjuntos) -> %s", file_name, len(entries), storage.kind)
     jobs.set_progress(job_id, current_file=file_name, current_file_rows=len(entries))
+
+    # Precarga (en GCP: lista el prefijo una vez) para omitir lo ya subido
+    storage.preload()
 
     # Detecta que destinos (subcarpeta SR + nombre original) se repiten dentro
     # del CSV. Solo esos adjuntos se prefijan con el DmDocumentId para no
@@ -663,6 +698,7 @@ def download_metadata_file(
     skipped = 0
     downloaded = 0
     errors: list[dict] = []
+    done_rels: set[str] = set()
     counters_lock = threading.Lock()
 
     def download(row: dict) -> None:
@@ -670,18 +706,19 @@ def download_metadata_file(
         # Con el circuito abierto o en apagado, drena la cola sin llamar al API
         if shutdown_event.is_set() or (breaker and breaker.is_open()):
             raise CircuitOpen()
-        target_path = resolve_target_path(row, output_folder, duplicate_keys)
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        if os.path.exists(target_path) and not overwrite:
+        rel = resolve_target_rel(row, duplicate_keys)
+        if storage.exists(rel) and not overwrite:
             with counters_lock:
                 skipped += 1
+                done_rels.add(rel)
             jobs.increment(job_id, "skipped_existing")
             return
-        client.download_binary(row[HREF_COLUMN].strip(), target_path)
+        client.stream_binary(row[HREF_COLUMN].strip(), storage.sink(rel))
         if breaker:
             breaker.record_success()
         with counters_lock:
             downloaded += 1
+            done_rels.add(rel)
         jobs.increment(job_id, "downloaded")
 
     with ThreadPoolExecutor(max_workers=max_workers or config.get_max_workers()) as pool:
@@ -711,20 +748,21 @@ def download_metadata_file(
             f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)"
         )
 
-    # Verificacion: cada adjunto esperado debe existir fisicamente en disco
+    # Verificacion: cada adjunto esperado quedo guardado (descargado u omitido
+    # por existir). Una subida/escritura que no lanzo excepcion esta confirmada.
     missing = [
-        os.path.relpath(path, output_folder)
-        for path in (resolve_target_path(row, output_folder, duplicate_keys) for row in entries)
-        if not os.path.exists(path)
+        resolve_target_rel(row, duplicate_keys)
+        for row in entries
+        if resolve_target_rel(row, duplicate_keys) not in done_rels
     ]
     if missing:
         logger.error(
-            "Verificacion %s: faltan %d de %d adjuntos en disco (ej.: %s)",
-            file_name, len(missing), len(entries), "; ".join(missing[:5]),
+            "Verificacion %s: faltan %d de %d adjuntos en %s (ej.: %s)",
+            file_name, len(missing), len(entries), storage.kind, "; ".join(missing[:5]),
         )
     verification = {
         "expected": len(entries),
-        "on_disk": len(entries) - len(missing),
+        "stored": len(entries) - len(missing),
         "missing_count": len(missing),
         "missing_sample": missing[:20],
         "ok": not missing and not errors,
@@ -732,6 +770,7 @@ def download_metadata_file(
 
     return {
         "metadata_file": file_name,
+        "destination": storage.kind,
         "total_rows": len(entries),
         "downloaded": downloaded,
         "skipped_existing": skipped,
@@ -747,6 +786,7 @@ def run_binary_job(
     output_folder: str,
     overwrite: bool,
     track_state: bool,
+    storage,
     max_workers: int | None = None,
 ) -> None:
     breaker = CircuitBreaker(config.get_circuit_threshold())
@@ -757,7 +797,7 @@ def run_binary_job(
             file_name = os.path.basename(csv_path)
             try:
                 result = download_metadata_file(
-                    client, csv_path, output_folder, overwrite, job_id, max_workers, breaker
+                    client, csv_path, storage, overwrite, job_id, max_workers, breaker
                 )
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
@@ -819,6 +859,7 @@ def get_attachment_binary(request: BinaryRequest):
     effective_workers = request.max_workers or config.get_max_workers()
     client = build_client(pool_size=effective_workers)
     os.makedirs(request.output_folder, exist_ok=True)
+    storage = build_storage(request)  # valida credenciales/bucket antes de encolar
     if request.metadata_csv:
         if not os.path.isfile(request.metadata_csv):
             raise HTTPException(status_code=400, detail=f"El archivo de metadatos no existe: {request.metadata_csv}")
@@ -862,7 +903,7 @@ def get_attachment_binary(request: BinaryRequest):
     )
     start_job_thread(
         run_binary_job,
-        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state, effective_workers),
+        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state, storage, effective_workers),
     )
     return {
         "job_id": job["job_id"],
