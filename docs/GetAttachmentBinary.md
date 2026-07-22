@@ -142,6 +142,8 @@ Un archivo se marca como **procesado** en `_downloaded_files.json` cuando no le 
 
 Esto evita que un archivo con, por ejemplo, adjuntos `404` (que Oracle nunca va a servir) se quede tomándose indefinidamente sin poder llegar a "no hay pendientes".
 
+**Tope de corridas (`OSC_MAX_FILE_ATTEMPTS`, por defecto 3):** algunos errores clasificados como transitorios en realidad recurren siempre (p. ej. Oracle corta el stream del mismo adjunto en cada intento — `STREAM`). Para que tampoco esos bloqueen el avance, si un archivo completa `OSC_MAX_FILE_ATTEMPTS` corridas con los mismos errores persistentes, se marca como procesado igual, registrando `unresolved_errors` y `attempts` en el manifiesto (y el detalle en `_errores.csv`). El contador vive en `_retry_attempts.json` (en `output_folder`) y se limpia si el archivo termina bien. `0` = sin tope (comportamiento anterior).
+
 ### `<nombre>_control.csv` — detalle por adjunto (opcional)
 
 Con **`detail_control: true`** se genera además el control fila-por-adjunto (cada adjunto con su `Location` `gs://...`/ruta y estado). Está **apagado por defecto** porque con 50k+ adjuntos por archivo genera millones de filas.

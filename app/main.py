@@ -146,6 +146,54 @@ def errors_all_permanent(errors: list[dict]) -> bool:
     return all(is_permanent_error_code(e.get("code", "")) for e in errors)
 
 
+def finish_file_state(output_folder: str, state_file: str, file_name: str, result: dict, entry: dict) -> None:
+    """Marca el archivo como procesado o lo deja pendiente, con tope de corridas.
+
+    - Sin errores reintentables (exito o solo 4xx permanentes): se marca.
+    - Con errores reintentables: queda pendiente, PERO se cuenta la corrida; tras
+      OSC_MAX_FILE_ATTEMPTS corridas completas con errores persistentes (def. 3)
+      se marca igual con 'unresolved_errors' para no reprocesarlo por siempre
+      (p. ej. adjuntos cuyo stream Oracle corta deterministicamente).
+    """
+    if not has_retriable_errors(result):
+        perm = permanent_error_count(result)
+        if perm:
+            logger.warning(
+                "Archivo %s marcado como procesado con %d error(es) permanente(s) (4xx); ver _errores.csv",
+                file_name, perm,
+            )
+        mark_processed(output_folder, state_file, file_name, {**entry, "permanent_errors": perm})
+        clear_file_attempts(output_folder, file_name)
+        return
+
+    retriable = [e for e in result.get("errors", []) if not is_permanent_error_code(e.get("code", ""))]
+    attempts = note_file_attempt(output_folder, file_name)
+    limit = config.get_max_file_attempts()
+    if limit > 0 and attempts >= limit:
+        logger.error(
+            "Archivo %s: %d corrida(s) completas con error(es) persistentes (%d sin resolver); "
+            "se marca como procesado para no reprocesarlo mas. Detalle en _errores.csv / errors.log",
+            file_name, attempts, len(retriable) or 1,
+        )
+        mark_processed(
+            output_folder,
+            state_file,
+            file_name,
+            {
+                **entry,
+                "permanent_errors": permanent_error_count(result),
+                "unresolved_errors": len(retriable) or 1,
+                "attempts": attempts,
+            },
+        )
+        clear_file_attempts(output_folder, file_name)
+    else:
+        logger.warning(
+            "Archivo %s termina con %d error(es) reintentable(s) (corrida %d de %s); queda pendiente",
+            file_name, len(retriable) or 1, attempts, limit if limit > 0 else "sin tope",
+        )
+
+
 def start_job_thread(target, args) -> None:
     thread = threading.Thread(target=target, args=args, daemon=True)
     _job_threads.append(thread)
@@ -346,15 +394,59 @@ def load_state(folder: str, state_file: str) -> dict:
         return json.load(fh)
 
 
+def _write_state(folder: str, state_file: str, state: dict) -> None:
+    """Escribe un archivo de estado con reemplazo atomico, tolerante a Windows.
+
+    En Windows os.replace falla con WinError 5 (Acceso denegado) si el destino
+    esta abierto (visor/antivirus). Se reintenta; si persiste, se registra sin
+    romper el job (el peor caso es que el archivo se re-tome en otra corrida).
+    """
+    path = os.path.join(folder, state_file)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+    for _ in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    try:
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("No se pudo escribir %s: %s", path, exc)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def mark_processed(folder: str, state_file: str, key: str, entry: dict) -> None:
     with _state_lock:
         state = load_state(folder, state_file)
         state[key] = entry
-        path = os.path.join(folder, state_file)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        _write_state(folder, state_file, state)
+
+
+RETRY_ATTEMPTS_FILE = "_retry_attempts.json"
+
+
+def note_file_attempt(folder: str, file_name: str) -> int:
+    """Registra una corrida completa con errores persistentes; devuelve el acumulado."""
+    with _state_lock:
+        state = load_state(folder, RETRY_ATTEMPTS_FILE)
+        attempts = int(state.get(file_name, 0)) + 1
+        state[file_name] = attempts
+        _write_state(folder, RETRY_ATTEMPTS_FILE, state)
+        return attempts
+
+
+def clear_file_attempts(folder: str, file_name: str) -> None:
+    with _state_lock:
+        state = load_state(folder, RETRY_ATTEMPTS_FILE)
+        if file_name in state:
+            del state[file_name]
+            _write_state(folder, RETRY_ATTEMPTS_FILE, state)
 
 
 def list_csv_files(folder: str) -> list[str]:
@@ -605,28 +697,19 @@ def run_metadata_job(
             results.append(result)
 
             had_errors = had_errors or "error" in result or bool(result.get("errors"))
-            # Se marca como procesado si no quedan errores reintentables (exito o
-            # solo errores permanentes 4xx); los transitorios lo dejan pendiente.
-            if not has_retriable_errors(result):
-                perm = permanent_error_count(result)
-                if perm:
-                    logger.warning(
-                        "Archivo %s marcado como procesado con %d SR con error permanente (4xx)",
-                        file_name, perm,
-                    )
-                mark_processed(
-                    output_folder,
-                    METADATA_STATE_FILE,
-                    file_name,
-                    {
-                        "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "job_id": job_id,
-                        "output_file": result["output_file"],
-                        "service_requests": result["service_requests"],
-                        "attachments": result["attachments"],
-                        "permanent_errors": perm,
-                    },
-                )
+            finish_file_state(
+                output_folder,
+                METADATA_STATE_FILE,
+                file_name,
+                result,
+                {
+                    "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "job_id": job_id,
+                    "output_file": result.get("output_file", ""),
+                    "service_requests": result.get("service_requests", 0),
+                    "attachments": result.get("attachments", 0),
+                },
+            )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
         summary = {
             "files": len(results),
@@ -1049,27 +1132,17 @@ def run_binary_job(
             results.append(result)
 
             had_errors = had_errors or "error" in result or bool(result.get("errors"))
-            # Se marca como procesado si NO quedan errores reintentables (exito,
-            # o solo errores permanentes 4xx que no van a resolverse). Asi un
-            # archivo con adjuntos 404 no se reprocesa indefinidamente.
-            if track_state and not has_retriable_errors(result):
-                perm = permanent_error_count(result)
-                if perm:
-                    logger.warning(
-                        "Archivo %s marcado como procesado con %d adjunto(s) con error permanente "
-                        "(404/4xx) que no se reintentaran; ver _errores.csv",
-                        file_name, perm,
-                    )
-                mark_processed(
+            if track_state:
+                finish_file_state(
                     output_folder,
                     BINARY_STATE_FILE,
                     file_name,
+                    result,
                     {
                         "job_id": job_id,
-                        "downloaded": result["downloaded"],
-                        "skipped_existing": result["skipped_existing"],
-                        "total_rows": result["total_rows"],
-                        "permanent_errors": perm,
+                        "downloaded": result.get("downloaded", 0),
+                        "skipped_existing": result.get("skipped_existing", 0),
+                        "total_rows": result.get("total_rows", 0),
                     },
                 )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
@@ -1372,27 +1445,20 @@ def run_clob_messages_job(
             results.append(result)
 
             had_errors = had_errors or "error" in result or bool(result.get("errors"))
-            if not has_retriable_errors(result):
-                perm = permanent_error_count(result)
-                if perm:
-                    logger.warning(
-                        "Archivo %s marcado como procesado con %d SR con error permanente (4xx)",
-                        file_name, perm,
-                    )
-                mark_processed(
-                    output_folder,
-                    CLOB_MESSAGES_STATE_FILE,
-                    file_name,
-                    {
-                        "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "job_id": job_id,
-                        "clob_file": result["clob_file"],
-                        "messages_file": result["messages_file"],
-                        "service_requests": result["service_requests"],
-                        "messages": result["messages"],
-                        "permanent_errors": perm,
-                    },
-                )
+            finish_file_state(
+                output_folder,
+                CLOB_MESSAGES_STATE_FILE,
+                file_name,
+                result,
+                {
+                    "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "job_id": job_id,
+                    "clob_file": result.get("clob_file", ""),
+                    "messages_file": result.get("messages_file", ""),
+                    "service_requests": result.get("service_requests", 0),
+                    "messages": result.get("messages", 0),
+                },
+            )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
         summary = {
             "files": len(results),

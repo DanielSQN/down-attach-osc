@@ -57,3 +57,9 @@ def get_circuit_threshold() -> int:
 def get_gcp_service_account_file() -> str:
     """Ruta al JSON de la cuenta de servicio de GCP (vacio = credenciales por defecto)."""
     return os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip()
+
+
+def get_max_file_attempts() -> int:
+    """Corridas completas con errores persistentes tras las cuales un archivo
+    se da por terminado igual, para no reprocesarlo indefinidamente (0 = nunca)."""
+    return int(os.getenv("OSC_MAX_FILE_ATTEMPTS", "3"))
