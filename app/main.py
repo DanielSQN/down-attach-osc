@@ -135,6 +135,9 @@ METADATA_STATE_FILE = "_processed_files.json"
 BINARY_STATE_FILE = "_downloaded_files.json"
 CLOB_MESSAGES_STATE_FILE = "_processed_clob_messages.json"
 
+# CSV de control por archivo de metadata: que adjunto quedo donde y con que estado
+CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status", "Error"]
+
 # GetMetadataClobAndMessages: campos CLOB (base64 -> texto) y campos de mensajes
 CLOB_FIELDS = ["arin_comentarios_cifrado_c", "col_tex_plantilla_c"]
 CLOB_OUTPUT_COLUMNS = [REFERENCE_COLUMN, *CLOB_FIELDS]
@@ -665,6 +668,7 @@ def download_metadata_file(
     client: OscClient,
     csv_path: str,
     storage,
+    output_folder: str,
     overwrite: bool,
     job_id: str,
     max_workers: int | None = None,
@@ -699,7 +703,19 @@ def download_metadata_file(
     downloaded = 0
     errors: list[dict] = []
     done_rels: set[str] = set()
+    control: dict[str, dict] = {}  # rel -> fila de control (estado final por adjunto)
     counters_lock = threading.Lock()
+
+    def record_control(row: dict, rel: str, status: str, error: str = "") -> None:
+        with counters_lock:
+            control[rel] = {
+                REFERENCE_COLUMN: (row.get(REFERENCE_COLUMN) or "").strip(),
+                "FileName": row.get("FileName", ""),
+                "StoredAs": rel,
+                "Location": storage.location(rel),
+                "Status": status,
+                "Error": error,
+            }
 
     def download(row: dict) -> None:
         nonlocal skipped, downloaded
@@ -712,6 +728,7 @@ def download_metadata_file(
                 skipped += 1
                 done_rels.add(rel)
             jobs.increment(job_id, "skipped_existing")
+            record_control(row, rel, "skipped_existing")
             return
         client.stream_binary(row[HREF_COLUMN].strip(), storage.sink(rel))
         if breaker:
@@ -720,6 +737,7 @@ def download_metadata_file(
             downloaded += 1
             done_rels.add(rel)
         jobs.increment(job_id, "downloaded")
+        record_control(row, rel, "downloaded")
 
     with ThreadPoolExecutor(max_workers=max_workers or config.get_max_workers()) as pool:
         futures = {pool.submit(download, row): row for row in entries}
@@ -737,6 +755,7 @@ def download_metadata_file(
                 logger.error("Error descargando adjunto de SR %s (%s): %s", reference, row.get("FileName"), exc)
                 errors.append({"srNumber": reference, "fileName": row.get("FileName"), "error": str(exc)})
                 jobs.increment(job_id, "download_errors")
+                record_control(row, resolve_target_rel(row, duplicate_keys), "error", str(exc))
                 if breaker and is_transient_error(exc):
                     breaker.record_failure()
 
@@ -747,6 +766,23 @@ def download_metadata_file(
         raise CircuitOpen(
             f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)"
         )
+
+    # Archivo de control: por cada adjunto, donde quedo (gs://... o ruta local) y su estado
+    base = os.path.splitext(file_name)[0]
+    control_path = os.path.join(output_folder, f"{base}_control.csv")
+    with open(control_path, "w", newline="", encoding="utf-8-sig") as ctrl_fh:
+        writer = csv.DictWriter(ctrl_fh, fieldnames=CONTROL_COLUMNS)
+        writer.writeheader()
+        for row in entries:
+            rel = resolve_target_rel(row, duplicate_keys)
+            writer.writerow(control.get(rel, {
+                REFERENCE_COLUMN: (row.get(REFERENCE_COLUMN) or "").strip(),
+                "FileName": row.get("FileName", ""),
+                "StoredAs": rel,
+                "Location": storage.location(rel),
+                "Status": "pending",
+                "Error": "",
+            }))
 
     # Verificacion: cada adjunto esperado quedo guardado (descargado u omitido
     # por existir). Una subida/escritura que no lanzo excepcion esta confirmada.
@@ -771,6 +807,7 @@ def download_metadata_file(
     return {
         "metadata_file": file_name,
         "destination": storage.kind,
+        "control_file": control_path,
         "total_rows": len(entries),
         "downloaded": downloaded,
         "skipped_existing": skipped,
@@ -797,7 +834,7 @@ def run_binary_job(
             file_name = os.path.basename(csv_path)
             try:
                 result = download_metadata_file(
-                    client, csv_path, storage, overwrite, job_id, max_workers, breaker
+                    client, csv_path, storage, output_folder, overwrite, job_id, max_workers, breaker
                 )
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
