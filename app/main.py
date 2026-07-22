@@ -102,6 +102,20 @@ def is_transient_error(exc: Exception) -> bool:
     return False
 
 
+def error_code(exc: Exception) -> str:
+    """Codigo corto del error: el status HTTP (404, 503...) o el tipo (TIMEOUT, CONN...)."""
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None):
+        return str(response.status_code)
+    if isinstance(exc, requests.Timeout):
+        return "TIMEOUT"
+    if isinstance(exc, requests.exceptions.ChunkedEncodingError):
+        return "STREAM"
+    if isinstance(exc, requests.ConnectionError):
+        return "CONN"
+    return type(exc).__name__
+
+
 def start_job_thread(target, args) -> None:
     thread = threading.Thread(target=target, args=args, daemon=True)
     _job_threads.append(thread)
@@ -140,7 +154,7 @@ CLOB_MESSAGES_STATE_FILE = "_processed_clob_messages.json"
 HOST = re.sub(r"[^A-Za-z0-9_.-]", "_", socket.gethostname()) or "host"
 
 # Control detallado (opcional): una fila por adjunto — grande con 50k+ adjuntos
-CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status", "Error"]
+CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status", "Code", "Error"]
 # Resumen por solicitud: conteo de adjuntos cargados por Reference Number
 SR_SUMMARY_COLUMNS = [REFERENCE_COLUMN, "total", "cargados", "downloaded", "skipped_existing", "error"]
 # Resumen compacto por archivo (1 fila): totales + host/job para saber de que proceso salio
@@ -448,8 +462,12 @@ def process_input_file(
                 except CircuitOpen:
                     continue  # SR no consultado; queda pendiente para la proxima corrida
                 except Exception as exc:
-                    logger.error("Error consultando adjuntos de SR %s: %s", reference, exc)
-                    errors.append({"srNumber": reference, "error": str(exc)})
+                    code = error_code(exc)
+                    logger.error(
+                        "Error consultando adjuntos | archivo=%s | SR=%s | code=%s | %s",
+                        file_name, reference, code, exc,
+                    )
+                    errors.append({"file": file_name, "srNumber": reference, "code": code, "error": str(exc)})
                     jobs.increment(job_id, "sr_errors")
                     if breaker and is_transient_error(exc):
                         breaker.record_failure()
@@ -747,7 +765,7 @@ def download_metadata_file(
     control: dict[str, dict] = {}  # rel -> fila de control (estado final por adjunto)
     counters_lock = threading.Lock()
 
-    def record_control(row: dict, rel: str, status: str, error: str = "") -> None:
+    def record_control(row: dict, rel: str, status: str, error: str = "", code: str = "") -> None:
         with counters_lock:
             control[rel] = {
                 REFERENCE_COLUMN: (row.get(REFERENCE_COLUMN) or "").strip(),
@@ -755,6 +773,7 @@ def download_metadata_file(
                 "StoredAs": rel,
                 "Location": storage.location(rel),
                 "Status": status,
+                "Code": code,
                 "Error": error,
             }
 
@@ -793,10 +812,17 @@ def download_metadata_file(
                 continue  # descarga no intentada; queda pendiente para la proxima corrida
             except Exception as exc:
                 reference = (row.get(REFERENCE_COLUMN) or "").strip()
-                logger.error("Error descargando adjunto de SR %s (%s): %s", reference, row.get("FileName"), exc)
-                errors.append({"srNumber": reference, "fileName": row.get("FileName"), "error": str(exc)})
+                code = error_code(exc)
+                logger.error(
+                    "Error descargando | archivo=%s | SR=%s | adjunto=%s | code=%s | %s",
+                    file_name, reference, row.get("FileName"), code, exc,
+                )
+                errors.append({
+                    "file": file_name, "srNumber": reference, "fileName": row.get("FileName"),
+                    "code": code, "error": str(exc),
+                })
                 jobs.increment(job_id, "download_errors")
-                record_control(row, resolve_target_rel(row, duplicate_keys), "error", str(exc))
+                record_control(row, resolve_target_rel(row, duplicate_keys), "error", str(exc), code)
                 if breaker and is_transient_error(exc):
                     breaker.record_failure()
 
@@ -824,6 +850,7 @@ def download_metadata_file(
             "StoredAs": rel,
             "Location": storage.location(rel),
             "Status": "pending",
+            "Code": "",
             "Error": "",
         })
 
@@ -1191,8 +1218,12 @@ def process_clob_messages_file(
                 except CircuitOpen:
                     continue
                 except Exception as exc:
-                    logger.error("Error consultando clob/messages de SR %s: %s", sr, exc)
-                    errors.append({"srNumber": sr, "error": str(exc)})
+                    code = error_code(exc)
+                    logger.error(
+                        "Error consultando clob/messages | archivo=%s | SR=%s | code=%s | %s",
+                        file_name, sr, code, exc,
+                    )
+                    errors.append({"file": file_name, "srNumber": sr, "code": code, "error": str(exc)})
                     jobs.increment(job_id, "sr_errors")
                     if breaker and is_transient_error(exc):
                         breaker.record_failure()
