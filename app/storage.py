@@ -98,3 +98,37 @@ class GcpStorage:
 
     def location(self, rel: str) -> str:
         return f"gs://{self.bucket.name}/{self._name(rel)}"
+
+    def check(self, write_test: bool = True) -> dict:
+        """Prueba la conexion: autenticacion + listar (+ subir/borrar de prueba).
+
+        Devuelve que verificaciones pasaron y el error donde se detuvo. No lanza.
+        """
+        import time
+
+        checks: dict = {"auth_list": False, "write": None, "delete": None}
+        errors: dict = {}
+        try:
+            # Listar valida autenticacion, acceso al bucket y permiso de listado
+            next(iter(self.client.list_blobs(self.bucket, prefix=self.prefix or None, max_results=1)), None)
+            checks["auth_list"] = True
+        except Exception as exc:
+            errors["auth_list"] = str(exc)
+            return {"checks": checks, "errors": errors}
+        if write_test:
+            name = self._name(f"_healthcheck_{int(time.time() * 1000)}.txt")
+            try:
+                blob = self.bucket.blob(name)
+                blob.upload_from_string(b"ok", content_type="text/plain")
+                checks["write"] = True
+                try:
+                    blob.delete()
+                    checks["delete"] = True
+                except Exception as exc:
+                    # El job no borra; falta de permiso de delete no lo invalida
+                    checks["delete"] = False
+                    errors["delete"] = str(exc)
+            except Exception as exc:
+                checks["write"] = False
+                errors["write"] = str(exc)
+        return {"checks": checks, "errors": errors}

@@ -12,6 +12,7 @@ Los dos métodos son **asíncronos**: encolan un job en segundo plano y devuelve
 | `GET /jobs/{job_id}` | Estatus y avance de un job (`running`, `completed`, `completed_with_errors`, `failed`, `interrupted`). |
 | `GET /jobs` | Lista de los últimos jobs. |
 | `GET /health` | Verifica con una llamada mínima si el API de Oracle responde (útil para saber si un mantenimiento terminó antes de relanzar). |
+| `GET /health/gcp` | Verifica la conexión a un bucket de GCP con la cuenta de servicio (auth + listar + subir/borrar de prueba). |
 | `GET /attachments/{srNumber}` | Consulta en vivo los adjuntos de un Reference Number puntual (sin archivos), para validaciones ad-hoc. |
 
 Especificación campo a campo de cada método (petición, respuesta, errores y archivos generados):
