@@ -134,6 +134,14 @@ Solo los adjuntos con `Status=error` (Reference Number, FileName, StoredAs, Loca
 
 Cada error también se escribe en el **`errors.log`** con el formato: `archivo=<csv> | SR=<referenceNumber> | adjunto=<fileName> | code=<código> | <mensaje>`, para saber en qué archivo y solicitud ocurrió y con qué código sin abrir el CSV.
 
+### Errores permanentes vs. transitorios (importante para la reanudación)
+
+Un archivo se marca como **procesado** en `_downloaded_files.json` cuando no le quedan errores **reintentables**:
+- **Permanentes** (`400, 401, 403, 404, 405, 406, 410`): el recurso no existe / no está permitido; reintentar no cambia nada. Un archivo cuyos únicos errores son permanentes **se da por completo** (queda su `permanent_errors` en el manifiesto y el detalle en `_errores.csv`), y **no se reprocesa** en las siguientes corridas.
+- **Transitorios** (`5xx, 429, TIMEOUT, CONN, STREAM`, o desconocidos): el archivo **queda pendiente** y se reintenta en la próxima corrida.
+
+Esto evita que un archivo con, por ejemplo, adjuntos `404` (que Oracle nunca va a servir) se quede tomándose indefinidamente sin poder llegar a "no hay pendientes".
+
 ### `<nombre>_control.csv` — detalle por adjunto (opcional)
 
 Con **`detail_control: true`** se genera además el control fila-por-adjunto (cada adjunto con su `Location` `gs://...`/ruta y estado). Está **apagado por defecto** porque con 50k+ adjuntos por archivo genera millones de filas.
