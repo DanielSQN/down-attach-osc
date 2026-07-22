@@ -116,6 +116,36 @@ def error_code(exc: Exception) -> str:
     return type(exc).__name__
 
 
+# Errores de cliente definitivos: no sirve reintentar (el recurso no existe/no
+# esta permitido). Un archivo cuyos unicos errores son de estos codigos se marca
+# como procesado igual, para no reprocesarlo indefinidamente.
+PERMANENT_ERROR_CODES = {"400", "401", "403", "404", "405", "406", "410"}
+
+
+def is_permanent_error_code(code: str) -> bool:
+    return code in PERMANENT_ERROR_CODES
+
+
+def has_retriable_errors(result: dict) -> bool:
+    """True si el archivo tiene errores que vale la pena reintentar (=> no marcarlo como hecho).
+
+    Un error a nivel de archivo, o cualquier error de adjunto que NO sea 4xx
+    permanente (5xx, timeout, red, o desconocido) mantiene el archivo pendiente.
+    """
+    if "error" in result:
+        return True
+    return any(not is_permanent_error_code(e.get("code", "")) for e in result.get("errors", []))
+
+
+def permanent_error_count(result: dict) -> int:
+    return sum(1 for e in result.get("errors", []) if is_permanent_error_code(e.get("code", "")))
+
+
+def errors_all_permanent(errors: list[dict]) -> bool:
+    """True si no hay errores, o todos son permanentes (no reintentables)."""
+    return all(is_permanent_error_code(e.get("code", "")) for e in errors)
+
+
 def start_job_thread(target, args) -> None:
     thread = threading.Thread(target=target, args=args, daemon=True)
     _job_threads.append(thread)
@@ -499,22 +529,31 @@ def process_input_file(
     with open(output_path, newline="", encoding="utf-8-sig") as fh:
         attachments = max(sum(1 for _ in fh) - 1, 0)
 
-    if not errors:
-        # Archivo completo y sin errores: el checkpoint ya no hace falta
-        os.remove(progress_path)
+    if errors_all_permanent(errors):
+        # Sin errores, o solo errores permanentes (no reintentables): el checkpoint
+        # ya no hace falta y el archivo se dara por completo.
+        if os.path.exists(progress_path):
+            os.remove(progress_path)
 
     # Verificacion: todo SR esperado quedo consultado o registrado como error
     consulted = len(pairs) - len(errors)
+    retriable = [e for e in errors if not is_permanent_error_code(e.get("code", ""))]
     verification = {
         "expected_srs": len(pairs),
         "consulted": consulted,
         "failed": len(errors),
+        "permanent_errors": len(errors) - len(retriable),
         "ok": len(errors) == 0,
     }
-    if errors:
+    if retriable:
         logger.error(
-            "Verificacion %s: %d de %d SR fallaron y quedan pendientes de reintento",
-            output_name, len(errors), len(pairs),
+            "Verificacion %s: %d de %d SR fallaron (reintentables) y quedan pendientes",
+            output_name, len(retriable), len(pairs),
+        )
+    elif errors:
+        logger.warning(
+            "Verificacion %s: %d SR con error permanente (4xx); el archivo se da por completo",
+            output_name, len(errors),
         )
 
     logger.info("Generado %s (%d adjuntos, %d errores)", output_name, attachments, len(errors))
@@ -565,11 +604,16 @@ def run_metadata_job(
                 release_file(output_folder, METADATA_STATE_FILE, file_name)
             results.append(result)
 
-            file_failed = "error" in result or bool(result.get("errors"))
-            had_errors = had_errors or file_failed
-            # Solo los archivos completados sin errores quedan como procesados;
-            # los que fallaron vuelven a ser candidatos en la siguiente corrida.
-            if not file_failed:
+            had_errors = had_errors or "error" in result or bool(result.get("errors"))
+            # Se marca como procesado si no quedan errores reintentables (exito o
+            # solo errores permanentes 4xx); los transitorios lo dejan pendiente.
+            if not has_retriable_errors(result):
+                perm = permanent_error_count(result)
+                if perm:
+                    logger.warning(
+                        "Archivo %s marcado como procesado con %d SR con error permanente (4xx)",
+                        file_name, perm,
+                    )
                 mark_processed(
                     output_folder,
                     METADATA_STATE_FILE,
@@ -580,6 +624,7 @@ def run_metadata_job(
                         "output_file": result["output_file"],
                         "service_requests": result["service_requests"],
                         "attachments": result["attachments"],
+                        "permanent_errors": perm,
                     },
                 )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
@@ -1003,9 +1048,18 @@ def run_binary_job(
                 release_file(output_folder, BINARY_STATE_FILE, file_name)
             results.append(result)
 
-            file_failed = "error" in result or bool(result.get("errors"))
-            had_errors = had_errors or file_failed
-            if track_state and not file_failed:
+            had_errors = had_errors or "error" in result or bool(result.get("errors"))
+            # Se marca como procesado si NO quedan errores reintentables (exito,
+            # o solo errores permanentes 4xx que no van a resolverse). Asi un
+            # archivo con adjuntos 404 no se reprocesa indefinidamente.
+            if track_state and not has_retriable_errors(result):
+                perm = permanent_error_count(result)
+                if perm:
+                    logger.warning(
+                        "Archivo %s marcado como procesado con %d adjunto(s) con error permanente "
+                        "(404/4xx) que no se reintentaran; ver _errores.csv",
+                        file_name, perm,
+                    )
                 mark_processed(
                     output_folder,
                     BINARY_STATE_FILE,
@@ -1015,6 +1069,7 @@ def run_binary_job(
                         "downloaded": result["downloaded"],
                         "skipped_existing": result["skipped_existing"],
                         "total_rows": result["total_rows"],
+                        "permanent_errors": perm,
                     },
                 )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
@@ -1246,8 +1301,9 @@ def process_clob_messages_file(
     if breaker and breaker.is_open():
         raise CircuitOpen(f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)")
 
-    if not errors:
-        os.remove(progress_path)
+    if errors_all_permanent(errors):
+        if os.path.exists(progress_path):
+            os.remove(progress_path)
 
     consulted = len(pairs) - len(errors)
     verification = {
@@ -1315,9 +1371,14 @@ def run_clob_messages_job(
                 release_file(output_folder, CLOB_MESSAGES_STATE_FILE, file_name)
             results.append(result)
 
-            file_failed = "error" in result or bool(result.get("errors"))
-            had_errors = had_errors or file_failed
-            if not file_failed:
+            had_errors = had_errors or "error" in result or bool(result.get("errors"))
+            if not has_retriable_errors(result):
+                perm = permanent_error_count(result)
+                if perm:
+                    logger.warning(
+                        "Archivo %s marcado como procesado con %d SR con error permanente (4xx)",
+                        file_name, perm,
+                    )
                 mark_processed(
                     output_folder,
                     CLOB_MESSAGES_STATE_FILE,
@@ -1329,6 +1390,7 @@ def run_clob_messages_job(
                         "messages_file": result["messages_file"],
                         "service_requests": result["service_requests"],
                         "messages": result["messages"],
+                        "permanent_errors": perm,
                     },
                 )
             jobs.set_progress(job_id, processed_files=index, current_file=None)
