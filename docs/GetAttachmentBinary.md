@@ -26,6 +26,7 @@ Debe enviarse **exactamente uno** de `metadata_csv` o `metadata_folder`.
 | `destination` | string | No | `"local"` | Destino de los binarios: `"local"` (guarda en `output_folder`) o `"gcp"` (sube a un bucket de GCP). |
 | `gcp_bucket` | string | Requerido si `destination=gcp` | `null` | Nombre del bucket de GCP destino. |
 | `gcp_prefix` | string | No | `""` | Prefijo (carpeta) dentro del bucket. Los objetos quedan en `<prefix>/<Reference Number>/<FileName>`. |
+| `detail_control` | booleano | No | `false` | `true` = genera además el `_control.csv` fila-por-adjunto (grande; ver Archivos de control). |
 
 ### Destino GCP
 
@@ -107,43 +108,39 @@ Además, `result.summary` agrega el total del job: `{ "files", "expected", "down
 
 ---
 
-## Archivo de control (auditoría)
+## Archivos de control (auditoría)
 
-Por cada CSV de metadata procesado se genera en `output_folder` un **`<nombre>_control.csv`** con una fila por adjunto, que registra dónde quedó cada uno y con qué estado (aplica a destino local y GCP):
+Por cada CSV de metadata procesado se generan en `output_folder` estos CSV. Están pensados para **archivos grandes (50k+ adjuntos) y varias máquinas**: por defecto son **compactos** (no una fila por adjunto).
 
-| Columna | Descripción |
-|---|---|
-| `Reference Number` | El srNumber del adjunto. |
-| `FileName` | Nombre original del adjunto. |
-| `StoredAs` | Ruta relativa del objeto (`<Reference Number>/<FileName>`, con prefijo `DmDocumentId` en colisiones). |
-| `Location` | Ubicación final: `gs://<bucket>/<prefix>/<StoredAs>` (GCP) o la ruta local completa. |
-| `Status` | `downloaded`, `skipped_existing` o `error`. |
-| `Error` | Mensaje del error si `Status=error`. |
+### `<nombre>_resumen.csv` — resumen compacto (1 fila)
 
-Se reescribe completo en cada corrida (una corrida completa procesa todas las filas, descargando u omitiendo), así refleja el estado actual. La ruta del control también viene en `result.results[].control_file`.
-
-### Resumen por solicitud
-
-Además se genera **`<nombre>_resumen_sr.csv`** con el conteo de adjuntos por Reference Number:
+El control principal: totales del archivo, más quién lo procesó.
 
 | Columna | Descripción |
 |---|---|
-| `Reference Number` | La solicitud. |
-| `total` | Adjuntos del SR en el CSV. |
+| `metadata_file`, `host`, `job_id`, `processed_at` | Qué archivo, en qué **máquina** y **job**, y cuándo. |
+| `total_solicitudes` | Solicitudes (Reference Number únicos) del archivo. |
+| `total_adjuntos` | Adjuntos totales. |
 | `cargados` | Cuántos quedaron en destino (`downloaded` + `skipped_existing`). |
-| `downloaded` | Descargados en esta corrida. |
-| `skipped_existing` | Omitidos por ya existir. |
-| `error` | Fallidos. |
+| `downloaded`, `skipped_existing`, `errores` | Desglose. |
 
-### Solo errores
+### `<nombre>_resumen_sr.csv` — conteo por solicitud
 
-Y **`<nombre>_errores.csv`** con únicamente los adjuntos que fallaron (mismas columnas que el control), para revisarlos o reintentarlos sin filtrar. Si no hubo errores, queda solo con el encabezado.
+Una fila por Reference Number: `total`, `cargados`, `downloaded`, `skipped_existing`, `error`.
 
-### Control en el bucket (destino GCP)
+### `<nombre>_errores.csv` — solo los fallidos
 
-Con `destination=gcp`, los tres archivos (`_control.csv`, `_resumen_sr.csv` y `_errores.csv`) se **suben también al bucket** bajo `gs://<bucket>/<gcp_prefix>/_control/`, además de quedar en `output_folder`. Así el conteo de adjuntos cargados por solicitud y los errores quedan disponibles junto a los objetos en GCP. (En destino local solo quedan en `output_folder`.)
+Solo los adjuntos con `Status=error` (Reference Number, FileName, StoredAs, Location, Status, Error), para revisarlos/reintentarlos sin filtrar. Si no hubo errores, queda solo el encabezado.
 
-> Todos los archivos de control son **CSV** (abribles y manipulables en Excel/PowerShell). El único JSON es el manifiesto interno `_downloaded_files.json` y los estados de jobs (bookkeeping).
+### `<nombre>_control.csv` — detalle por adjunto (opcional)
+
+Con **`detail_control: true`** se genera además el control fila-por-adjunto (cada adjunto con su `Location` `gs://...`/ruta y estado). Está **apagado por defecto** porque con 50k+ adjuntos por archivo genera millones de filas.
+
+### Varias máquinas
+
+Cada máquina escribe en **su propia `output_folder` local**. Con `destination=gcp`, los controles se suben al bucket bajo **`gs://<bucket>/<gcp_prefix>/_control/<host>/`** — una subcarpeta por máquina (`host`), así **no se sobrescriben** entre nodos y se sabe cuál es de cuál proceso (también por las columnas `host`/`job_id` del `_resumen.csv`). No se anexan líneas a un CSV compartido (GCS no permite append seguro entre máquinas): son archivos separados por host que se consolidan listando `_control/`.
+
+> Todos los archivos de control son **CSV**. El único JSON es el manifiesto interno `_downloaded_files.json` y los estados de jobs (bookkeeping).
 
 ## Archivos generados
 

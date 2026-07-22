@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from collections import Counter
@@ -135,10 +136,18 @@ METADATA_STATE_FILE = "_processed_files.json"
 BINARY_STATE_FILE = "_downloaded_files.json"
 CLOB_MESSAGES_STATE_FILE = "_processed_clob_messages.json"
 
-# CSV de control por archivo de metadata: que adjunto quedo donde y con que estado
+# Identificador de esta maquina/proceso, para distinguir controles entre nodos
+HOST = re.sub(r"[^A-Za-z0-9_.-]", "_", socket.gethostname()) or "host"
+
+# Control detallado (opcional): una fila por adjunto — grande con 50k+ adjuntos
 CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status", "Error"]
 # Resumen por solicitud: conteo de adjuntos cargados por Reference Number
 SR_SUMMARY_COLUMNS = [REFERENCE_COLUMN, "total", "cargados", "downloaded", "skipped_existing", "error"]
+# Resumen compacto por archivo (1 fila): totales + host/job para saber de que proceso salio
+RUN_SUMMARY_COLUMNS = [
+    "metadata_file", "host", "job_id", "processed_at",
+    "total_solicitudes", "total_adjuntos", "cargados", "downloaded", "skipped_existing", "errores",
+]
 
 # GetMetadataClobAndMessages: campos CLOB (base64 -> texto) y campos de mensajes
 CLOB_FIELDS = ["arin_comentarios_cifrado_c", "col_tex_plantilla_c"]
@@ -635,6 +644,7 @@ class BinaryRequest(BaseModel):
     destination: str = "local"
     gcp_bucket: Optional[str] = None  # requerido si destination=gcp
     gcp_prefix: str = ""  # prefijo opcional dentro del bucket
+    detail_control: bool = False  # true = genera el _control.csv fila-por-adjunto (grande)
 
     @model_validator(mode="after")
     def _validate(self):
@@ -675,6 +685,7 @@ def download_metadata_file(
     job_id: str,
     max_workers: int | None = None,
     breaker: CircuitBreaker | None = None,
+    detail_control: bool = False,
 ) -> dict:
     file_name = os.path.basename(csv_path)
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
@@ -769,44 +780,52 @@ def download_metadata_file(
             f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)"
         )
 
-    # Archivo de control: por cada adjunto, donde quedo (gs://... o ruta local) y su estado
+    # ------- Controles (CSV) -------
+    # Se calculan las estadisticas recorriendo entries una vez; el control
+    # detallado (una fila por adjunto) es opcional para no generar millones de
+    # filas con archivos de 50k adjuntos.
     base = os.path.splitext(file_name)[0]
-    control_path = os.path.join(output_folder, f"{base}_control.csv")
-    errors_path = os.path.join(output_folder, f"{base}_errores.csv")
     sr_stats: dict[str, dict] = {}
     error_rows: list[dict] = []
-    with open(control_path, "w", newline="", encoding="utf-8-sig") as ctrl_fh:
-        writer = csv.DictWriter(ctrl_fh, fieldnames=CONTROL_COLUMNS)
-        writer.writeheader()
+
+    def control_row(row: dict) -> dict:
+        rel = resolve_target_rel(row, duplicate_keys)
+        return control.get(rel, {
+            REFERENCE_COLUMN: (row.get(REFERENCE_COLUMN) or "").strip(),
+            "FileName": row.get("FileName", ""),
+            "StoredAs": rel,
+            "Location": storage.location(rel),
+            "Status": "pending",
+            "Error": "",
+        })
+
+    detail_fh = None
+    detail_writer = None
+    control_path = os.path.join(output_folder, f"{base}_control.csv")
+    if detail_control:
+        detail_fh = open(control_path, "w", newline="", encoding="utf-8-sig")
+        detail_writer = csv.DictWriter(detail_fh, fieldnames=CONTROL_COLUMNS)
+        detail_writer.writeheader()
+    try:
         for row in entries:
-            rel = resolve_target_rel(row, duplicate_keys)
-            crow = control.get(rel, {
-                REFERENCE_COLUMN: (row.get(REFERENCE_COLUMN) or "").strip(),
-                "FileName": row.get("FileName", ""),
-                "StoredAs": rel,
-                "Location": storage.location(rel),
-                "Status": "pending",
-                "Error": "",
-            })
-            writer.writerow(crow)
+            crow = control_row(row)
+            if detail_writer:
+                detail_writer.writerow(crow)
             if crow["Status"] == "error":
                 error_rows.append(crow)
-            ref = crow[REFERENCE_COLUMN]
             stat = sr_stats.setdefault(
-                ref, {"total": 0, "downloaded": 0, "skipped_existing": 0, "error": 0, "pending": 0}
+                crow[REFERENCE_COLUMN],
+                {"total": 0, "downloaded": 0, "skipped_existing": 0, "error": 0, "pending": 0},
             )
             stat["total"] += 1
             stat[crow["Status"]] = stat.get(crow["Status"], 0) + 1
+    finally:
+        if detail_fh:
+            detail_fh.close()
 
-    # CSV dedicado solo con los adjuntos que fallaron (para revisar/reintentar)
-    with open(errors_path, "w", newline="", encoding="utf-8-sig") as err_fh:
-        writer = csv.DictWriter(err_fh, fieldnames=CONTROL_COLUMNS)
-        writer.writeheader()
-        writer.writerows(error_rows)
-
-    # Resumen por solicitud: cuantos adjuntos se cargaron por Reference Number
-    summary_path = os.path.join(output_folder, f"{base}_resumen_sr.csv")
-    with open(summary_path, "w", newline="", encoding="utf-8-sig") as sum_fh:
+    # Resumen por solicitud: adjuntos cargados por Reference Number
+    sr_summary_path = os.path.join(output_folder, f"{base}_resumen_sr.csv")
+    with open(sr_summary_path, "w", newline="", encoding="utf-8-sig") as sum_fh:
         writer = csv.DictWriter(sum_fh, fieldnames=SR_SUMMARY_COLUMNS)
         writer.writeheader()
         for ref, s in sr_stats.items():
@@ -819,10 +838,38 @@ def download_metadata_file(
                 "error": s["error"],
             })
 
-    # Si el destino es GCP, sube los controles al bucket (bajo <prefix>/_control/)
-    for path in (control_path, summary_path, errors_path):
+    # Solo errores (chico)
+    errors_path = os.path.join(output_folder, f"{base}_errores.csv")
+    with open(errors_path, "w", newline="", encoding="utf-8-sig") as err_fh:
+        writer = csv.DictWriter(err_fh, fieldnames=CONTROL_COLUMNS)
+        writer.writeheader()
+        writer.writerows(error_rows)
+
+    # Resumen compacto del archivo (1 fila): totales + host/job (que proceso lo hizo)
+    run_summary_path = os.path.join(output_folder, f"{base}_resumen.csv")
+    with open(run_summary_path, "w", newline="", encoding="utf-8-sig") as rs_fh:
+        writer = csv.DictWriter(rs_fh, fieldnames=RUN_SUMMARY_COLUMNS)
+        writer.writeheader()
+        writer.writerow({
+            "metadata_file": file_name,
+            "host": HOST,
+            "job_id": job_id,
+            "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "total_solicitudes": len(sr_stats),
+            "total_adjuntos": len(entries),
+            "cargados": downloaded + skipped,
+            "downloaded": downloaded,
+            "skipped_existing": skipped,
+            "errores": len(errors),
+        })
+
+    # Si el destino es GCP, sube los controles al bucket bajo <prefix>/_control/<host>/
+    uploaded_paths = [run_summary_path, sr_summary_path, errors_path]
+    if detail_control:
+        uploaded_paths.append(control_path)
+    for path in uploaded_paths:
         with open(path, "rb") as fh:
-            uploaded = storage.upload_control(os.path.basename(path), fh.read())
+            uploaded = storage.upload_control(f"{HOST}/{os.path.basename(path)}", fh.read())
         if uploaded:
             logger.info("Control subido a %s", uploaded)
 
@@ -849,9 +896,10 @@ def download_metadata_file(
     return {
         "metadata_file": file_name,
         "destination": storage.kind,
-        "control_file": control_path,
-        "sr_summary_file": summary_path,
+        "run_summary_file": run_summary_path,
+        "sr_summary_file": sr_summary_path,
         "errors_file": errors_path,
+        "control_file": control_path if detail_control else None,
         "total_rows": len(entries),
         "downloaded": downloaded,
         "skipped_existing": skipped,
@@ -869,6 +917,7 @@ def run_binary_job(
     track_state: bool,
     storage,
     max_workers: int | None = None,
+    detail_control: bool = False,
 ) -> None:
     breaker = CircuitBreaker(config.get_circuit_threshold())
     results: list[dict] = []
@@ -878,7 +927,7 @@ def run_binary_job(
             file_name = os.path.basename(csv_path)
             try:
                 result = download_metadata_file(
-                    client, csv_path, storage, output_folder, overwrite, job_id, max_workers, breaker
+                    client, csv_path, storage, output_folder, overwrite, job_id, max_workers, breaker, detail_control
                 )
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
@@ -984,7 +1033,7 @@ def get_attachment_binary(request: BinaryRequest):
     )
     start_job_thread(
         run_binary_job,
-        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state, storage, effective_workers),
+        (job["job_id"], client, batch, request.output_folder, request.overwrite, track_state, storage, effective_workers, request.detail_control),
     )
     return {
         "job_id": job["job_id"],
