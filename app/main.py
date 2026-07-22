@@ -772,7 +772,9 @@ def download_metadata_file(
     # Archivo de control: por cada adjunto, donde quedo (gs://... o ruta local) y su estado
     base = os.path.splitext(file_name)[0]
     control_path = os.path.join(output_folder, f"{base}_control.csv")
+    errors_path = os.path.join(output_folder, f"{base}_errores.csv")
     sr_stats: dict[str, dict] = {}
+    error_rows: list[dict] = []
     with open(control_path, "w", newline="", encoding="utf-8-sig") as ctrl_fh:
         writer = csv.DictWriter(ctrl_fh, fieldnames=CONTROL_COLUMNS)
         writer.writeheader()
@@ -787,12 +789,20 @@ def download_metadata_file(
                 "Error": "",
             })
             writer.writerow(crow)
+            if crow["Status"] == "error":
+                error_rows.append(crow)
             ref = crow[REFERENCE_COLUMN]
             stat = sr_stats.setdefault(
                 ref, {"total": 0, "downloaded": 0, "skipped_existing": 0, "error": 0, "pending": 0}
             )
             stat["total"] += 1
             stat[crow["Status"]] = stat.get(crow["Status"], 0) + 1
+
+    # CSV dedicado solo con los adjuntos que fallaron (para revisar/reintentar)
+    with open(errors_path, "w", newline="", encoding="utf-8-sig") as err_fh:
+        writer = csv.DictWriter(err_fh, fieldnames=CONTROL_COLUMNS)
+        writer.writeheader()
+        writer.writerows(error_rows)
 
     # Resumen por solicitud: cuantos adjuntos se cargaron por Reference Number
     summary_path = os.path.join(output_folder, f"{base}_resumen_sr.csv")
@@ -809,8 +819,8 @@ def download_metadata_file(
                 "error": s["error"],
             })
 
-    # Si el destino es GCP, sube ambos controles al bucket (bajo <prefix>/_control/)
-    for path in (control_path, summary_path):
+    # Si el destino es GCP, sube los controles al bucket (bajo <prefix>/_control/)
+    for path in (control_path, summary_path, errors_path):
         with open(path, "rb") as fh:
             uploaded = storage.upload_control(os.path.basename(path), fh.read())
         if uploaded:
@@ -841,6 +851,7 @@ def download_metadata_file(
         "destination": storage.kind,
         "control_file": control_path,
         "sr_summary_file": summary_path,
+        "errors_file": errors_path,
         "total_rows": len(entries),
         "downloaded": downloaded,
         "skipped_existing": skipped,

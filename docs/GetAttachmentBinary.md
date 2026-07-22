@@ -135,9 +135,15 @@ Además se genera **`<nombre>_resumen_sr.csv`** con el conteo de adjuntos por Re
 | `skipped_existing` | Omitidos por ya existir. |
 | `error` | Fallidos. |
 
+### Solo errores
+
+Y **`<nombre>_errores.csv`** con únicamente los adjuntos que fallaron (mismas columnas que el control), para revisarlos o reintentarlos sin filtrar. Si no hubo errores, queda solo con el encabezado.
+
 ### Control en el bucket (destino GCP)
 
-Con `destination=gcp`, ambos archivos (`_control.csv` y `_resumen_sr.csv`) se **suben también al bucket** bajo `gs://<bucket>/<gcp_prefix>/_control/`, además de quedar en `output_folder`. Así el conteo de adjuntos cargados por solicitud queda disponible junto a los objetos en GCP. (En destino local solo quedan en `output_folder`.)
+Con `destination=gcp`, los tres archivos (`_control.csv`, `_resumen_sr.csv` y `_errores.csv`) se **suben también al bucket** bajo `gs://<bucket>/<gcp_prefix>/_control/`, además de quedar en `output_folder`. Así el conteo de adjuntos cargados por solicitud y los errores quedan disponibles junto a los objetos en GCP. (En destino local solo quedan en `output_folder`.)
+
+> Todos los archivos de control son **CSV** (abribles y manipulables en Excel/PowerShell). El único JSON es el manifiesto interno `_downloaded_files.json` y los estados de jobs (bookkeeping).
 
 ## Archivos generados
 
