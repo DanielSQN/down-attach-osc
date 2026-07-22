@@ -62,7 +62,7 @@ class GcpStorage:
 
     kind = "gcp"
 
-    def __init__(self, bucket: str, prefix: str = "", credentials_file: str = ""):
+    def __init__(self, bucket: str, prefix: str = "", credentials_file: str = "", pool_size: int = 10):
         # Import perezoso: solo se necesita google-cloud-storage si se usa GCP
         from google.cloud import storage as gcs
 
@@ -71,6 +71,18 @@ class GcpStorage:
         else:
             # Credenciales por defecto (GOOGLE_APPLICATION_CREDENTIALS / ADC)
             self.client = gcs.Client()
+        # El pool de conexiones de GCS es 10 por defecto; con mas workers en
+        # paralelo se descartan conexiones (WARNING "Connection pool is full").
+        # Se dimensiona al numero de workers para reutilizarlas.
+        try:
+            from requests.adapters import HTTPAdapter
+
+            size = max(pool_size, 10)
+            adapter = HTTPAdapter(pool_connections=size, pool_maxsize=size)
+            self.client._http.mount("https://", adapter)
+            self.client._http.mount("http://", adapter)
+        except Exception:  # best-effort: si no se puede, solo son warnings de rendimiento
+            pass
         self.bucket = self.client.bucket(bucket)
         self.prefix = (prefix or "").strip("/")
         self._existing: set[str] | None = None
