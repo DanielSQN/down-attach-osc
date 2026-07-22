@@ -130,7 +130,9 @@ Una fila por Reference Number: `total`, `cargados`, `downloaded`, `skipped_exist
 
 ### `<nombre>_errores.csv` — solo los fallidos
 
-Solo los adjuntos con `Status=error` (Reference Number, FileName, StoredAs, Location, Status, Error), para revisarlos/reintentarlos sin filtrar. Si no hubo errores, queda solo el encabezado.
+Solo los adjuntos con `Status=error` (Reference Number, FileName, StoredAs, Location, Status, **Code**, Error), para revisarlos/reintentarlos sin filtrar. `Code` es el código del error (`404`, `503`, `TIMEOUT`, `CONN`, `STREAM`…). Si no hubo errores, queda solo el encabezado.
+
+Cada error también se escribe en el **`errors.log`** con el formato: `archivo=<csv> | SR=<referenceNumber> | adjunto=<fileName> | code=<código> | <mensaje>`, para saber en qué archivo y solicitud ocurrió y con qué código sin abrir el CSV.
 
 ### `<nombre>_control.csv` — detalle por adjunto (opcional)
 
