@@ -12,10 +12,13 @@ del destino:
 
 import logging
 import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
 CHUNK = 1024 * 256
+# Buffer de subida a GCP: hasta este tamaño va en memoria; por encima, a disco temporal
+SPOOL_MAX = 16 * 1024 * 1024
 
 
 class LocalStorage:
@@ -91,8 +94,19 @@ class GcpStorage:
         blob = self.bucket.blob(self._name(rel))
 
         def _upload(response) -> None:
-            response.raw.decode_content = True
-            blob.upload_from_file(response.raw, content_type=response.headers.get("Content-Type"))
+            # Se vuelca el binario a un buffer con tamaño conocido y se sube con
+            # size explicito. NO se streamea response.raw: Oracle puede mandar el
+            # binario comprimido (gzip), y subir el stream crudo produce un
+            # desajuste de tamano (Content-Range) que GCS rechaza con 400.
+            # iter_content descomprime como lo haria requests.
+            with tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX) as buf:
+                for chunk in response.iter_content(chunk_size=CHUNK):
+                    buf.write(chunk)
+                size = buf.tell()
+                buf.seek(0)
+                blob.upload_from_file(
+                    buf, size=size, content_type=response.headers.get("Content-Type")
+                )
 
         return _upload
 
