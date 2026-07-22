@@ -122,6 +122,23 @@ Por cada CSV de metadata procesado se genera en `output_folder` un **`<nombre>_c
 
 Se reescribe completo en cada corrida (una corrida completa procesa todas las filas, descargando u omitiendo), así refleja el estado actual. La ruta del control también viene en `result.results[].control_file`.
 
+### Resumen por solicitud
+
+Además se genera **`<nombre>_resumen_sr.csv`** con el conteo de adjuntos por Reference Number:
+
+| Columna | Descripción |
+|---|---|
+| `Reference Number` | La solicitud. |
+| `total` | Adjuntos del SR en el CSV. |
+| `cargados` | Cuántos quedaron en destino (`downloaded` + `skipped_existing`). |
+| `downloaded` | Descargados en esta corrida. |
+| `skipped_existing` | Omitidos por ya existir. |
+| `error` | Fallidos. |
+
+### Control en el bucket (destino GCP)
+
+Con `destination=gcp`, ambos archivos (`_control.csv` y `_resumen_sr.csv`) se **suben también al bucket** bajo `gs://<bucket>/<gcp_prefix>/_control/`, además de quedar en `output_folder`. Así el conteo de adjuntos cargados por solicitud queda disponible junto a los objetos en GCP. (En destino local solo quedan en `output_folder`.)
+
 ## Archivos generados
 
 - Binarios en `output_folder/<Reference Number>/<FileName>`. Los adjuntos se guardan con su `FileName` original. **Solo cuando dos o más adjuntos del mismo SR comparten el mismo `FileName`** (colisión dentro del CSV), esos se prefijan con el `DmDocumentId` (único por adjunto) → `<DmDocumentId>_<FileName>`, para que ninguno se pierda; si no viniera `DmDocumentId` se usa `AttachedDocumentId`. Los que no colisionan mantienen su nombre tal cual. Los caracteres inválidos para Windows en el nombre (`< > : " / \ | ? *`) se reemplazan por `_`. Si la fila no trae `FileName`, se usa `Title` y en último caso `adjunto`.

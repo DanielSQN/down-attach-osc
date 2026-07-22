@@ -52,6 +52,10 @@ class LocalStorage:
     def location(self, rel: str) -> str:
         return self._full(rel)
 
+    def upload_control(self, name: str, data: bytes, content_type: str = "text/csv") -> str | None:
+        # En local los archivos de control ya quedan en output_folder; no se duplican
+        return None
+
 
 class GcpStorage:
     """Sube los binarios a un bucket de GCP usando una cuenta de servicio."""
@@ -112,6 +116,12 @@ class GcpStorage:
 
     def location(self, rel: str) -> str:
         return f"gs://{self.bucket.name}/{self._name(rel)}"
+
+    def upload_control(self, name: str, data: bytes, content_type: str = "text/csv") -> str | None:
+        """Sube un archivo de control al bucket, bajo <prefix>/_control/."""
+        obj = f"{self.prefix}/_control/{name}" if self.prefix else f"_control/{name}"
+        self.bucket.blob(obj).upload_from_string(data, content_type=content_type)
+        return f"gs://{self.bucket.name}/{obj}"
 
     def check(self, write_test: bool = True) -> dict:
         """Prueba la conexion: autenticacion + listar (+ subir/borrar de prueba).
