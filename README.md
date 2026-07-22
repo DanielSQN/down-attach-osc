@@ -21,6 +21,7 @@ Especificación campo a campo de cada método (petición, respuesta, errores y a
 - [docs/GetMetadataClobAndMessages.md](docs/GetMetadataClobAndMessages.md)
 - [docs/Jobs.md](docs/Jobs.md)
 - [docs/ValidarReferenceNumber.md](docs/ValidarReferenceNumber.md) — cómo validar desde Windows si un Reference Number quedó en los archivos de metadata
+- [docs/GCP_CuentaDeServicio.md](docs/GCP_CuentaDeServicio.md) — configurar la subida a un bucket de GCP (cuenta de servicio, permisos, JSON, red)
 
 ## Estrategia de lotes y reanudación
 
