@@ -107,6 +107,21 @@ Además, `result.summary` agrega el total del job: `{ "files", "expected", "down
 
 ---
 
+## Archivo de control (auditoría)
+
+Por cada CSV de metadata procesado se genera en `output_folder` un **`<nombre>_control.csv`** con una fila por adjunto, que registra dónde quedó cada uno y con qué estado (aplica a destino local y GCP):
+
+| Columna | Descripción |
+|---|---|
+| `Reference Number` | El srNumber del adjunto. |
+| `FileName` | Nombre original del adjunto. |
+| `StoredAs` | Ruta relativa del objeto (`<Reference Number>/<FileName>`, con prefijo `DmDocumentId` en colisiones). |
+| `Location` | Ubicación final: `gs://<bucket>/<prefix>/<StoredAs>` (GCP) o la ruta local completa. |
+| `Status` | `downloaded`, `skipped_existing` o `error`. |
+| `Error` | Mensaje del error si `Status=error`. |
+
+Se reescribe completo en cada corrida (una corrida completa procesa todas las filas, descargando u omitiendo), así refleja el estado actual. La ruta del control también viene en `result.results[].control_file`.
+
 ## Archivos generados
 
 - Binarios en `output_folder/<Reference Number>/<FileName>`. Los adjuntos se guardan con su `FileName` original. **Solo cuando dos o más adjuntos del mismo SR comparten el mismo `FileName`** (colisión dentro del CSV), esos se prefijan con el `DmDocumentId` (único por adjunto) → `<DmDocumentId>_<FileName>`, para que ninguno se pierda; si no viniera `DmDocumentId` se usa `AttachedDocumentId`. Los que no colisionan mantienen su nombre tal cual. Los caracteres inválidos para Windows en el nombre (`< > : " / \ | ? *`) se reemplazan por `_`. Si la fila no trae `FileName`, se usa `Title` y en último caso `adjunto`.
