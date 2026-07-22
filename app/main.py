@@ -137,6 +137,8 @@ CLOB_MESSAGES_STATE_FILE = "_processed_clob_messages.json"
 
 # CSV de control por archivo de metadata: que adjunto quedo donde y con que estado
 CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status", "Error"]
+# Resumen por solicitud: conteo de adjuntos cargados por Reference Number
+SR_SUMMARY_COLUMNS = [REFERENCE_COLUMN, "total", "cargados", "downloaded", "skipped_existing", "error"]
 
 # GetMetadataClobAndMessages: campos CLOB (base64 -> texto) y campos de mensajes
 CLOB_FIELDS = ["arin_comentarios_cifrado_c", "col_tex_plantilla_c"]
@@ -770,19 +772,49 @@ def download_metadata_file(
     # Archivo de control: por cada adjunto, donde quedo (gs://... o ruta local) y su estado
     base = os.path.splitext(file_name)[0]
     control_path = os.path.join(output_folder, f"{base}_control.csv")
+    sr_stats: dict[str, dict] = {}
     with open(control_path, "w", newline="", encoding="utf-8-sig") as ctrl_fh:
         writer = csv.DictWriter(ctrl_fh, fieldnames=CONTROL_COLUMNS)
         writer.writeheader()
         for row in entries:
             rel = resolve_target_rel(row, duplicate_keys)
-            writer.writerow(control.get(rel, {
+            crow = control.get(rel, {
                 REFERENCE_COLUMN: (row.get(REFERENCE_COLUMN) or "").strip(),
                 "FileName": row.get("FileName", ""),
                 "StoredAs": rel,
                 "Location": storage.location(rel),
                 "Status": "pending",
                 "Error": "",
-            }))
+            })
+            writer.writerow(crow)
+            ref = crow[REFERENCE_COLUMN]
+            stat = sr_stats.setdefault(
+                ref, {"total": 0, "downloaded": 0, "skipped_existing": 0, "error": 0, "pending": 0}
+            )
+            stat["total"] += 1
+            stat[crow["Status"]] = stat.get(crow["Status"], 0) + 1
+
+    # Resumen por solicitud: cuantos adjuntos se cargaron por Reference Number
+    summary_path = os.path.join(output_folder, f"{base}_resumen_sr.csv")
+    with open(summary_path, "w", newline="", encoding="utf-8-sig") as sum_fh:
+        writer = csv.DictWriter(sum_fh, fieldnames=SR_SUMMARY_COLUMNS)
+        writer.writeheader()
+        for ref, s in sr_stats.items():
+            writer.writerow({
+                REFERENCE_COLUMN: ref,
+                "total": s["total"],
+                "cargados": s["downloaded"] + s["skipped_existing"],
+                "downloaded": s["downloaded"],
+                "skipped_existing": s["skipped_existing"],
+                "error": s["error"],
+            })
+
+    # Si el destino es GCP, sube ambos controles al bucket (bajo <prefix>/_control/)
+    for path in (control_path, summary_path):
+        with open(path, "rb") as fh:
+            uploaded = storage.upload_control(os.path.basename(path), fh.read())
+        if uploaded:
+            logger.info("Control subido a %s", uploaded)
 
     # Verificacion: cada adjunto esperado quedo guardado (descargado u omitido
     # por existir). Una subida/escritura que no lanzo excepcion esta confirmada.
@@ -808,6 +840,7 @@ def download_metadata_file(
         "metadata_file": file_name,
         "destination": storage.kind,
         "control_file": control_path,
+        "sr_summary_file": summary_path,
         "total_rows": len(entries),
         "downloaded": downloaded,
         "skipped_existing": skipped,
