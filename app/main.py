@@ -321,6 +321,18 @@ def list_csv_files(folder: str) -> list[str]:
     )
 
 
+def partition_files(files: list[str], worker_index: int, worker_count: int) -> list[str]:
+    """Reparte los archivos entre N workers de forma deterministica y disjunta.
+
+    Cada maquina/proceso lanza el mismo llamado con su worker_index (0..N-1) y
+    procesa solo su parte (por posicion en la lista ordenada), sin coordinacion
+    ni riesgo de que dos toquen el mismo archivo.
+    """
+    if worker_count <= 1:
+        return files
+    return [f for i, f in enumerate(files) if i % worker_count == worker_index]
+
+
 # ---------------------------------------------------------------------------
 # GetMetadataAttachments
 # ---------------------------------------------------------------------------
@@ -335,6 +347,15 @@ class MetadataRequest(BaseModel):
     force: bool = False  # true = reprocesar aunque esten en _processed_files.json
     # Llamadas en paralelo solo para este job; si no se envia, usa OSC_MAX_WORKERS
     max_workers: Optional[int] = Field(default=None, ge=1, le=64)
+    # Particion multi-maquina: cada worker procesa su parte de los archivos
+    worker_index: int = Field(default=0, ge=0)
+    worker_count: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_worker(self):
+        if self.worker_index >= self.worker_count:
+            raise ValueError("worker_index debe ser menor que worker_count")
+        return self
 
 
 def read_sr_numbers(csv_path: str) -> list[tuple[str, str]]:
@@ -593,6 +614,7 @@ def get_metadata_attachments(request: MetadataRequest):
         input_files = list_csv_files(request.input_folder)
         if not input_files:
             raise HTTPException(status_code=400, detail="La carpeta de entrada no contiene archivos .csv")
+        input_files = partition_files(input_files, request.worker_index, request.worker_count)
         state = {} if request.force else load_state(request.output_folder, METADATA_STATE_FILE)
         batch, pending_after = reserve_batch(
             input_files, request.output_folder, METADATA_STATE_FILE, state, request.batch_size
@@ -600,8 +622,8 @@ def get_metadata_attachments(request: MetadataRequest):
         if not batch:
             return {
                 "job_id": None,
-                "message": "No hay archivos pendientes: todos estan registrados en "
-                f"{METADATA_STATE_FILE} o en proceso por otro job (use force=true para reprocesar)",
+                "message": "No hay archivos pendientes para este worker: ya procesados, "
+                f"en proceso por otro job, o fuera de su particion (use force=true para reprocesar)",
                 "total_files": len(input_files),
             }
 
@@ -645,6 +667,9 @@ class BinaryRequest(BaseModel):
     gcp_bucket: Optional[str] = None  # requerido si destination=gcp
     gcp_prefix: str = ""  # prefijo opcional dentro del bucket
     detail_control: bool = False  # true = genera el _control.csv fila-por-adjunto (grande)
+    # Particion multi-maquina (solo con metadata_folder)
+    worker_index: int = Field(default=0, ge=0)
+    worker_count: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _validate(self):
@@ -654,6 +679,8 @@ class BinaryRequest(BaseModel):
             raise ValueError("destination debe ser 'local' o 'gcp'")
         if self.destination == "gcp" and not self.gcp_bucket:
             raise ValueError("gcp_bucket es requerido cuando destination='gcp'")
+        if self.worker_index >= self.worker_count:
+            raise ValueError("worker_index debe ser menor que worker_count")
         return self
 
 
@@ -1009,6 +1036,7 @@ def get_attachment_binary(request: BinaryRequest):
         files = list_csv_files(request.metadata_folder)
         if not files:
             raise HTTPException(status_code=400, detail="La carpeta de metadatos no contiene archivos .csv")
+        files = partition_files(files, request.worker_index, request.worker_count)
         state = {} if request.force else load_state(request.output_folder, BINARY_STATE_FILE)
         batch, pending_after = reserve_batch(
             files, request.output_folder, BINARY_STATE_FILE, state, request.batch_size
@@ -1017,8 +1045,8 @@ def get_attachment_binary(request: BinaryRequest):
         if not batch:
             return {
                 "job_id": None,
-                "message": "No hay archivos pendientes: todos estan registrados en "
-                f"{BINARY_STATE_FILE} o en proceso por otro job (use force=true para reprocesar)",
+                "message": "No hay archivos pendientes para este worker: ya procesados, "
+                f"en proceso por otro job, o fuera de su particion (use force=true para reprocesar)",
                 "total_files": len(files),
             }
 
@@ -1057,6 +1085,15 @@ class ClobMessagesRequest(BaseModel):
     force: bool = False
     max_workers: Optional[int] = Field(default=None, ge=1, le=64)
     overwrite_html: bool = False  # true = volver a descargar HTMLs ya existentes
+    # Particion multi-maquina
+    worker_index: int = Field(default=0, ge=0)
+    worker_count: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_worker(self):
+        if self.worker_index >= self.worker_count:
+            raise ValueError("worker_index debe ser menor que worker_count")
+        return self
 
 
 def process_clob_messages_file(
@@ -1309,6 +1346,7 @@ def get_metadata_clob_and_messages(request: ClobMessagesRequest):
         input_files = list_csv_files(request.input_folder)
         if not input_files:
             raise HTTPException(status_code=400, detail="La carpeta de entrada no contiene archivos .csv")
+        input_files = partition_files(input_files, request.worker_index, request.worker_count)
         state = {} if request.force else load_state(request.output_folder, CLOB_MESSAGES_STATE_FILE)
         batch, pending_after = reserve_batch(
             input_files, request.output_folder, CLOB_MESSAGES_STATE_FILE, state, request.batch_size
@@ -1316,8 +1354,8 @@ def get_metadata_clob_and_messages(request: ClobMessagesRequest):
         if not batch:
             return {
                 "job_id": None,
-                "message": "No hay archivos pendientes: todos estan registrados en "
-                f"{CLOB_MESSAGES_STATE_FILE} o en proceso por otro job (use force=true para reprocesar)",
+                "message": "No hay archivos pendientes para este worker: ya procesados, "
+                f"en proceso por otro job, o fuera de su particion (use force=true para reprocesar)",
                 "total_files": len(input_files),
             }
 
