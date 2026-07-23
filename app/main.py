@@ -16,6 +16,7 @@ job_id; el avance y el resultado se consultan en GET /jobs/{job_id}.
 import base64
 import binascii
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -238,7 +239,7 @@ SR_SUMMARY_COLUMNS = [REFERENCE_COLUMN, "total", "cargados", "downloaded", "skip
 # Resumen compacto por archivo (1 fila): totales + host/job para saber de que proceso salio
 RUN_SUMMARY_COLUMNS = [
     "metadata_file", "host", "job_id", "processed_at",
-    "total_solicitudes", "total_adjuntos", "cargados", "downloaded", "skipped_existing", "errores",
+    "total_solicitudes", "total_adjuntos", "cargados", "downloaded", "skipped_existing", "errores", "sin_href",
 ]
 
 # GetMetadataClobAndMessages: campos CLOB (base64 -> texto) y campos de mensajes
@@ -336,7 +337,12 @@ def build_client(pool_size: int = 10) -> OscClient:
 
 
 def sanitize_filename(name: str) -> str:
-    return INVALID_FILENAME_CHARS.sub("_", name).strip() or "sin_nombre"
+    clean = INVALID_FILENAME_CHARS.sub("_", name).strip()
+    # "." o ".." como nombre cambiarian la carpeta destino en vez de nombrar
+    # un archivo dentro de ella
+    if not clean or clean.strip(".") == "":
+        return "sin_nombre"
+    return clean
 
 
 def decode_clob(value) -> str:
@@ -378,8 +384,13 @@ def resolve_target_rel(row: dict, duplicate_keys: set) -> str:
     subdir = target_subdir(reference)
     base = sanitize_filename(attachment_base_name(row))
     if (subdir, base) in duplicate_keys:
-        # Nombre repetido en el mismo SR: prefija con el id unico del adjunto
+        # Nombre repetido en el mismo SR: prefija con el id unico del adjunto.
+        # Sin id, se usa un hash del href (estable entre corridas) para que dos
+        # adjuntos homonimos no se pisen el mismo archivo destino.
         prefix = attachment_prefix(row)
+        if not prefix:
+            href = (row.get(HREF_COLUMN) or "").strip()
+            prefix = hashlib.md5(href.encode("utf-8")).hexdigest()[:10] if href else ""
         name = sanitize_filename(f"{prefix}_{attachment_base_name(row)}") if prefix else base
     else:
         name = base
@@ -449,11 +460,19 @@ def clear_file_attempts(folder: str, file_name: str) -> None:
             _write_state(folder, RETRY_ATTEMPTS_FILE, state)
 
 
+# CSVs de control/resumen que generan los propios jobs: nunca son entrada.
+# Se excluyen del listado para que, si la carpeta de salida coincide con la de
+# entrada (o se apunta por error a ella), no se intenten reprocesar.
+GENERATED_CSV_SUFFIXES = ("_control.csv", "_resumen.csv", "_resumen_sr.csv", "_errores.csv")
+
+
 def list_csv_files(folder: str) -> list[str]:
     return sorted(
         os.path.join(folder, name)
         for name in os.listdir(folder)
-        if name.lower().endswith(".csv") and not name.startswith("_")
+        if name.lower().endswith(".csv")
+        and not name.startswith("_")
+        and not name.lower().endswith(GENERATED_CSV_SUFFIXES)
     )
 
 
@@ -554,6 +573,7 @@ def process_input_file(
         current_file=file_name,
         current_file_srs=len(pairs),
         current_file_pending=len(pending),
+        current_file_done=len(pairs) - len(pending),
     )
 
     errors: list[dict] = []
@@ -591,6 +611,7 @@ def process_input_file(
                     )
                     errors.append({"file": file_name, "srNumber": reference, "code": code, "error": str(exc)})
                     jobs.increment(job_id, "sr_errors")
+                    jobs.increment(job_id, "current_file_done")
                     if breaker and is_transient_error(exc):
                         breaker.record_failure()
                     continue
@@ -609,6 +630,7 @@ def process_input_file(
                     prog_fh.write(reference + "\n")
                     prog_fh.flush()
                 jobs.increment(job_id, "srs_consulted")
+                jobs.increment(job_id, "current_file_done")
 
     if shutdown_event.is_set():
         # El checkpoint queda en disco: la proxima corrida retoma los SR faltantes
@@ -618,8 +640,10 @@ def process_input_file(
             f"{breaker.threshold} fallos transitorios consecutivos (5xx/429/red)"
         )
 
+    # Conteo con csv.reader (no lineas crudas): un FileName/Title con salto de
+    # linea embebido ocupa varias lineas fisicas pero es UNA fila.
     with open(output_path, newline="", encoding="utf-8-sig") as fh:
-        attachments = max(sum(1 for _ in fh) - 1, 0)
+        attachments = max(sum(1 for _ in csv.reader(fh)) - 1, 0)
 
     if errors_all_permanent(errors):
         # Sin errores, o solo errores permanentes (no reintentables): el checkpoint
@@ -869,10 +893,18 @@ def download_metadata_file(
                 f"El archivo {file_name} no tiene la columna '{HREF_COLUMN}' "
                 "(debe ser generado por GetMetadataAttachments)"
             )
-        entries = [row for row in reader if (row.get(HREF_COLUMN) or "").strip()]
+        all_rows = list(reader)
+    entries = [row for row in all_rows if (row.get(HREF_COLUMN) or "").strip()]
+    no_href = len(all_rows) - len(entries)
+    if no_href:
+        # Filas del CSV de metadatos sin enlace de descarga: no hay binario que
+        # bajar, pero se reporta para que no "desaparezcan" del control.
+        logger.warning("%s: %d fila(s) sin %s; se omiten (ver resumen)", file_name, no_href, HREF_COLUMN)
 
     logger.info("Descargando %s (%d adjuntos) -> %s", file_name, len(entries), storage.kind)
-    jobs.set_progress(job_id, current_file=file_name, current_file_rows=len(entries))
+    jobs.set_progress(
+        job_id, current_file=file_name, current_file_rows=len(entries), current_file_done=0
+    )
 
     # Precarga (en GCP: lista el prefijo una vez) para omitir lo ya subido
     storage.preload()
@@ -916,6 +948,7 @@ def download_metadata_file(
                 skipped += 1
                 done_rels.add(rel)
             jobs.increment(job_id, "skipped_existing")
+            jobs.increment(job_id, "current_file_done")
             record_control(row, rel, "skipped_existing")
             return
         client.stream_binary(row[HREF_COLUMN].strip(), storage.sink(rel))
@@ -925,6 +958,7 @@ def download_metadata_file(
             downloaded += 1
             done_rels.add(rel)
         jobs.increment(job_id, "downloaded")
+        jobs.increment(job_id, "current_file_done")
         record_control(row, rel, "downloaded")
 
     with ThreadPoolExecutor(max_workers=max_workers or config.get_max_workers()) as pool:
@@ -950,6 +984,7 @@ def download_metadata_file(
                     "code": code, "error": str(exc),
                 })
                 jobs.increment(job_id, "download_errors")
+                jobs.increment(job_id, "current_file_done")
                 record_control(row, resolve_target_rel(row, duplicate_keys), "error", str(exc), code)
                 if breaker and is_transient_error(exc):
                     breaker.record_failure()
@@ -1044,6 +1079,7 @@ def download_metadata_file(
             "downloaded": downloaded,
             "skipped_existing": skipped,
             "errores": len(errors),
+            "sin_href": no_href,
         })
 
     # Si el destino es GCP, sube los controles al bucket bajo <prefix>/_control/<host>/
@@ -1058,11 +1094,11 @@ def download_metadata_file(
 
     # Verificacion: cada adjunto esperado quedo guardado (descargado u omitido
     # por existir). Una subida/escritura que no lanzo excepcion esta confirmada.
-    missing = [
-        resolve_target_rel(row, duplicate_keys)
-        for row in entries
-        if resolve_target_rel(row, duplicate_keys) not in done_rels
-    ]
+    missing = []
+    for row in entries:
+        rel = resolve_target_rel(row, duplicate_keys)
+        if rel not in done_rels:
+            missing.append(rel)
     if missing:
         logger.error(
             "Verificacion %s: faltan %d de %d adjuntos en %s (ej.: %s)",
@@ -1084,6 +1120,7 @@ def download_metadata_file(
         "errors_file": errors_path,
         "control_file": control_path if detail_control else None,
         "total_rows": len(entries),
+        "rows_without_href": no_href,
         "downloaded": downloaded,
         "skipped_existing": skipped,
         "errors": errors,
@@ -1151,6 +1188,7 @@ def run_binary_job(
             "expected": sum(r.get("total_rows", 0) for r in results),
             "downloaded": sum(r.get("downloaded", 0) for r in results),
             "skipped_existing": sum(r.get("skipped_existing", 0) for r in results),
+            "rows_without_href": sum(r.get("rows_without_href", 0) for r in results),
             "missing": sum(r.get("verification", {}).get("missing_count", 0) for r in results),
             "all_ok": all(r.get("verification", {}).get("ok", False) for r in results),
         }
@@ -1290,7 +1328,11 @@ def process_clob_messages_file(
         file_name, len(pairs), len(pairs) - len(pending), len(pending),
     )
     jobs.set_progress(
-        job_id, current_file=file_name, current_file_srs=len(pairs), current_file_pending=len(pending)
+        job_id,
+        current_file=file_name,
+        current_file_srs=len(pairs),
+        current_file_pending=len(pending),
+        current_file_done=len(pairs) - len(pending),
     )
 
     errors: list[dict] = []
@@ -1353,6 +1395,7 @@ def process_clob_messages_file(
                     )
                     errors.append({"file": file_name, "srNumber": sr, "code": code, "error": str(exc)})
                     jobs.increment(job_id, "sr_errors")
+                    jobs.increment(job_id, "current_file_done")
                     if breaker and is_transient_error(exc):
                         breaker.record_failure()
                     continue
@@ -1368,6 +1411,7 @@ def process_clob_messages_file(
                     prog_fh.flush()
                     message_count += len(message_rows)
                 jobs.increment(job_id, "srs_consulted")
+                jobs.increment(job_id, "current_file_done")
 
     if shutdown_event.is_set():
         raise ShutdownRequested()

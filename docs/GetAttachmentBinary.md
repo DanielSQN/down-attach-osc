@@ -36,7 +36,7 @@ Con `destination: "gcp"` el binario se transmite **directamente desde Oracle al 
 GCP_SERVICE_ACCOUNT_FILE=C:\\ruta\\cuenta-servicio.json
 ```
 
-Si se deja vacío, usa las credenciales por defecto de GCP (ADC / `GOOGLE_APPLICATION_CREDENTIALS`). El `output_folder` sigue siendo obligatorio: ahí viven el manifiesto `_downloaded_files.json` y los checkpoints (los binarios NO se guardan en local). Para la reanudación, al iniciar cada archivo se lista una vez el prefijo del bucket y se omiten los objetos ya presentes (`skipped_existing`).
+Si se deja vacío, usa las credenciales por defecto de GCP (ADC / `GOOGLE_APPLICATION_CREDENTIALS`). El `output_folder` sigue siendo obligatorio: ahí viven el manifiesto `_downloaded_files.json` y los checkpoints (los binarios NO se guardan en local). Para la reanudación, se lista **una sola vez por job** el prefijo del bucket y se omiten los objetos ya presentes (`skipped_existing`); las subidas del propio job se registran en memoria, así que no hace falta re-listar entre archivos.
 
 > Requiere la dependencia `google-cloud-storage` (incluida en `requirements.txt`). Si falta, `destination=gcp` responde 500.
 >
@@ -97,6 +97,7 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed`, `completed_with
 |---|---|---|
 | `metadata_file` | string | Nombre del CSV de metadatos. |
 | `total_rows` | entero | Filas del CSV con `FileContentsHref` (adjuntos a descargar). |
+| `rows_without_href` | entero | Filas del CSV **sin** `FileContentsHref`: no hay binario que bajar; se omiten pero se cuentan para que no "desaparezcan" del control. |
 | `downloaded` | entero | Binarios descargados en esta corrida. |
 | `skipped_existing` | entero | Binarios omitidos por ya existir en disco. |
 | `errors` | array | Descargas fallidas: objetos `{ "srNumber": string, "fileName": string, "error": string }`. Se reintentan solos en la siguiente corrida. |
@@ -104,7 +105,7 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed`, `completed_with
 | `verification` | objeto | Confirmación de que cada adjunto quedó guardado: `{ "expected", "stored", "missing_count", "missing_sample", "ok" }`. Una subida/escritura que no lanzó error queda confirmada; `ok` es `true` si no falta ninguno. `missing_sample` lista hasta 20 rutas relativas faltantes. |
 | `error` | string | Solo presente si el CSV completo no se pudo procesar (p. ej. sin columna `FileContentsHref`). |
 
-Además, `result.summary` agrega el total del job: `{ "files", "expected", "downloaded", "skipped_existing", "missing", "all_ok" }`. `all_ok: true` significa que todos los adjuntos esperados quedaron en disco.
+Además, `result.summary` agrega el total del job: `{ "files", "expected", "downloaded", "skipped_existing", "rows_without_href", "missing", "all_ok" }`. `all_ok: true` significa que todos los adjuntos esperados quedaron en disco.
 
 ---
 
@@ -123,6 +124,7 @@ El control principal: totales del archivo, más quién lo procesó.
 | `total_adjuntos` | Adjuntos totales. |
 | `cargados` | Cuántos quedaron en destino (`downloaded` + `skipped_existing`). |
 | `downloaded`, `skipped_existing`, `errores` | Desglose. |
+| `sin_href` | Filas del CSV sin `FileContentsHref` (sin binario que bajar). |
 
 ### `<nombre>_resumen_sr.csv` — conteo por solicitud
 

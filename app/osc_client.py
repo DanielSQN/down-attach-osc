@@ -1,6 +1,7 @@
 """Cliente REST para Oracle Service Cloud / Fusion CRM (autenticacion Basic)."""
 
 import logging
+import os
 import random
 import threading
 import time
@@ -147,7 +148,12 @@ class OscClient:
             items.extend(page_items)
             if not data.get("hasMore"):
                 break
-            offset += len(page_items) if page_items else data.get("limit", 25)
+            if not page_items:
+                # hasMore=true con pagina vacia: respuesta inconsistente del API;
+                # se corta para no quedar paginando en bucle infinito.
+                logger.warning("Paginacion con hasMore=true y pagina vacia en %s (offset=%d); se detiene", url, offset)
+                break
+            offset += len(page_items)
         return items
 
     def stream_binary(self, href: str, sink) -> None:
@@ -188,12 +194,27 @@ class OscClient:
         raise last_exc
 
     def download_binary(self, href: str, target_path: str) -> None:
-        """Descarga el binario del enclosure FileContents a un archivo local."""
+        """Descarga el binario del enclosure FileContents a un archivo local.
+
+        Escribe a un .part y renombra al final: un corte a mitad de descarga no
+        deja un archivo final incompleto (que la reanudacion saltaria por existir).
+        """
+        tmp_path = f"{target_path}.part"
+
         def to_file(response) -> None:
-            with open(target_path, "wb") as fh:
+            with open(tmp_path, "wb") as fh:
                 for chunk in response.iter_content(chunk_size=1024 * 256):
                     fh.write(chunk)
-        self.stream_binary(href, to_file)
+
+        try:
+            self.stream_binary(href, to_file)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, target_path)
 
 
 def get_file_contents_href(item: dict) -> str:

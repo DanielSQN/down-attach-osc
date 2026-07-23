@@ -51,6 +51,7 @@ Devuelve el detalle completo de un job.
 | `current_file` | string \| null | Archivo en proceso en este momento (`null` entre archivos o al terminar). |
 | `current_file_srs` | entero | Reference Numbers únicos del archivo en curso. |
 | `current_file_pending` | entero | SRs del archivo en curso que faltaban al iniciar (descontando el checkpoint). |
+| `current_file_done` | entero | SRs del archivo en curso ya resueltos (consultados + fallidos, incluyendo los retomados del checkpoint). Avance dentro del archivo: `current_file_done / current_file_srs`. |
 | `srs_consulted` | entero | SRs consultados con éxito, acumulado del job. Se persiste a disco cada 25; el valor en vivo puede ir unos pasos adelante del archivo JSON. |
 | `sr_errors` | entero | SRs cuya consulta falló, acumulado del job. |
 
@@ -63,6 +64,7 @@ Devuelve el detalle completo de un job.
 | `pending_after_batch` | entero | CSVs de la carpeta que quedaron fuera del lote. |
 | `current_file` | string \| null | CSV en proceso en este momento. |
 | `current_file_rows` | entero | Filas (adjuntos) del CSV en curso. |
+| `current_file_done` | entero | Adjuntos del CSV en curso ya resueltos (descargados + omitidos + fallidos). Avance dentro del archivo: `current_file_done / current_file_rows`. |
 | `downloaded` | entero | Binarios descargados, acumulado del job. |
 | `skipped_existing` | entero | Binarios omitidos por ya existir en disco, acumulado. |
 | `download_errors` | entero | Descargas fallidas, acumulado. |

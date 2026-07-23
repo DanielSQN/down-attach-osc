@@ -77,6 +77,7 @@ class JobManager:
             job = self._jobs[job_id]
             job["progress"].update(fields)
             self._persist(job)
+            self._pending_writes[job_id] = 0
 
     def increment(self, job_id: str, field: str, persist_every: int = 25) -> None:
         """Incrementa un contador de progreso; escribe a disco cada persist_every."""
@@ -97,6 +98,7 @@ class JobManager:
             job["result"] = result
             job["error"] = error
             self._persist(job)
+            self._pending_writes.pop(job_id, None)
 
     def _mark_if_stale(self, job: dict) -> dict:
         # Un job "running" que no esta en memoria quedo cortado por un reinicio

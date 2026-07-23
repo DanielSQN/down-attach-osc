@@ -41,11 +41,23 @@ class LocalStorage:
     def sink(self, rel: str):
         path = self._full(rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.part"
 
         def _write(response) -> None:
-            with open(path, "wb") as fh:
-                for chunk in response.iter_content(chunk_size=CHUNK):
-                    fh.write(chunk)
+            # Se escribe a un .part y se renombra al final: si la descarga se
+            # corta, no queda un archivo final incompleto que la reanudacion
+            # saltaria como "ya existente".
+            try:
+                with open(tmp_path, "wb") as fh:
+                    for chunk in response.iter_content(chunk_size=CHUNK):
+                        fh.write(chunk)
+            except BaseException:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp_path, path)
 
         return _write
 
@@ -94,6 +106,11 @@ class GcpStorage:
     def preload(self) -> None:
         # Un solo listado del prefijo (paginado) en vez de un HEAD por objeto;
         # sirve para omitir en la reanudacion lo que ya esta en el bucket.
+        # Se lista UNA vez por job (no por archivo del lote): con millones de
+        # objetos re-listar por archivo es carisimo. Las subidas de este job
+        # se van agregando al set en sink(), asi que sigue al dia.
+        if self._existing is not None:
+            return
         names = set()
         for blob in self.client.list_blobs(self.bucket, prefix=self.prefix or None):
             names.add(blob.name)
@@ -123,6 +140,8 @@ class GcpStorage:
                 blob.upload_from_file(
                     buf, size=size, content_type=response.headers.get("Content-Type")
                 )
+            if self._existing is not None:
+                self._existing.add(blob.name)
 
         return _upload
 
@@ -133,6 +152,8 @@ class GcpStorage:
         """Sube un archivo de control al bucket, bajo <prefix>/_control/."""
         obj = f"{self.prefix}/_control/{name}" if self.prefix else f"_control/{name}"
         self.bucket.blob(obj).upload_from_string(data, content_type=content_type)
+        if self._existing is not None:
+            self._existing.add(obj)
         return f"gs://{self.bucket.name}/{obj}"
 
     def check(self, write_test: bool = True) -> dict:
