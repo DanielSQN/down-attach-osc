@@ -1103,8 +1103,12 @@ def download_metadata_file(
             "sin_href": no_href,
         })
 
-    # Si el destino es GCP, sube los controles al bucket bajo <prefix>/_control/<host>/
-    uploaded_paths = [run_summary_path, sr_summary_path, errors_path]
+    # Si el destino es GCP, sube los controles al bucket bajo <prefix>/_control/<host>/.
+    # Solo los esenciales y compactos: el resumen (totales del archivo) y los
+    # errores (lo NO migrado). El _resumen_sr.csv no se sube: es derivable del
+    # indice (cargados por SR = group-by de _index) + _errores.csv, y subirlo
+    # duplicaba el CSV grande por archivo; queda solo local.
+    uploaded_paths = [run_summary_path, errors_path]
     if detail_control:
         uploaded_paths.append(control_path)
     for path in uploaded_paths:

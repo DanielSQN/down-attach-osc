@@ -128,9 +128,9 @@ El control principal: totales del archivo, más quién lo procesó.
 | `downloaded`, `skipped_existing`, `errores` | Desglose. |
 | `sin_href` | Filas del CSV sin `FileContentsHref` (sin binario que bajar). |
 
-### `<nombre>_resumen_sr.csv` — conteo por solicitud
+### `<nombre>_resumen_sr.csv` — conteo por solicitud (solo local)
 
-Una fila por Reference Number: `total`, `cargados`, `downloaded`, `skipped_existing`, `error`.
+Una fila por Reference Number: `total`, `cargados`, `downloaded`, `skipped_existing`, `error`. **No se sube al bucket**: es derivable del índice (cargados por SR = agrupar `_index.csv` por `Reference Number`) más `_errores.csv`, y subirlo duplicaba el CSV grande por archivo. Queda en `output_folder` para revisiones rápidas en la máquina.
 
 ### `<nombre>_index.csv` — índice de búsqueda SR → ruta
 
@@ -156,11 +156,11 @@ Esto evita que un archivo con, por ejemplo, adjuntos `404` (que Oracle nunca va 
 
 ### `<nombre>_control.csv` — detalle por adjunto (opcional)
 
-Con **`detail_control: true`** se genera además el control fila-por-adjunto (cada adjunto con su `Location` `gs://...`/ruta y estado). Está **apagado por defecto** porque con 50k+ adjuntos por archivo genera millones de filas.
+Con **`detail_control: true`** se genera además el control fila-por-adjunto (cada adjunto con su `Location` `gs://...`/ruta y estado). Está **apagado por defecto** porque con 50k+ adjuntos por archivo genera millones de filas. En la práctica quedó **superado por `_index.csv` + `_errores.csv`** (confirmados + fallidos cubren todos los estados); mantenerlo apagado.
 
 ### Varias máquinas
 
-Cada máquina escribe en **su propia `output_folder` local**. Con `destination=gcp`, los controles se suben al bucket bajo **`gs://<bucket>/<gcp_prefix>/_control/<host>/`** — una subcarpeta por máquina (`host`), así **no se sobrescriben** entre nodos y se sabe cuál es de cuál proceso (también por las columnas `host`/`job_id` del `_resumen.csv`). No se anexan líneas a un CSV compartido (GCS no permite append seguro entre máquinas): son archivos separados por host que se consolidan listando `_control/`.
+Cada máquina escribe en **su propia `output_folder` local**. Con `destination=gcp`, se suben al bucket bajo **`gs://<bucket>/<gcp_prefix>/_control/<host>/`** solo los controles esenciales y compactos — `_resumen.csv` y `_errores.csv` (y `_control.csv` si se activó) — en una subcarpeta por máquina (`host`), así **no se sobrescriben** entre nodos y se sabe cuál es de cuál proceso (también por las columnas `host`/`job_id` del `_resumen.csv`). No se anexan líneas a un CSV compartido (GCS no permite append seguro entre máquinas): son archivos separados por host que se consolidan listando `_control/`.
 
 > Todos los archivos de control son **CSV**. El único JSON es el manifiesto interno `_downloaded_files.json` y los estados de jobs (bookkeeping).
 
