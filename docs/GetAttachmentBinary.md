@@ -102,6 +102,8 @@ Al terminar, `GET /jobs/{job_id}` devuelve `status` `completed`, `completed_with
 | `skipped_existing` | entero | Binarios omitidos por ya existir en disco. |
 | `errors` | array | Descargas fallidas: objetos `{ "srNumber": string, "fileName": string, "error": string }`. Se reintentan solos en la siguiente corrida. |
 | `destination` | string | `"local"` o `"gcp"`, el destino usado. |
+| `index_file` | string | Ruta local del `<nombre>_index.csv` (índice SR → ruta en destino). |
+| `indexed` | entero | Adjuntos incluidos en el índice (confirmados en destino). |
 | `verification` | objeto | Confirmación de que cada adjunto quedó guardado: `{ "expected", "stored", "missing_count", "missing_sample", "ok" }`. Una subida/escritura que no lanzó error queda confirmada; `ok` es `true` si no falta ninguno. `missing_sample` lista hasta 20 rutas relativas faltantes. |
 | `error` | string | Solo presente si el CSV completo no se pudo procesar (p. ej. sin columna `FileContentsHref`). |
 
@@ -129,6 +131,12 @@ El control principal: totales del archivo, más quién lo procesó.
 ### `<nombre>_resumen_sr.csv` — conteo por solicitud
 
 Una fila por Reference Number: `total`, `cargados`, `downloaded`, `skipped_existing`, `error`.
+
+### `<nombre>_index.csv` — índice de búsqueda SR → ruta
+
+Una fila por adjunto **confirmado en destino** (descargado u omitido por ya existir): `Reference Number`, `FileName`, `StoredAs` (ruta relativa), `Location` (ruta completa, p. ej. `gs://bucket/adjuntos/0002859140/doc.pdf`) y `metadata_file` (el CSV de origen). Los fallidos **no** se incluyen, así el índice nunca apunta a rutas que no existen; al reintentar el archivo, el índice se regenera completo.
+
+Con destino GCP se sube además a `gs://<bucket>/<prefix>/_index/<nombre>_index.csv` (sin subcarpeta por host: hay exactamente un índice por CSV de metadatos). Para obtener el **índice maestro** de toda la migración basta concatenar los índices de todos los archivos — con la columna `metadata_file` incluida, la unión es autodescriptiva. Sirve para localizar los adjuntos de cualquier SR sin saber de qué archivo vino, incluso si un mismo SR apareció en más de un CSV (el índice maestro trae todas sus rutas).
 
 ### `<nombre>_errores.csv` — solo los fallidos
 

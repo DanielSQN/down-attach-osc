@@ -49,6 +49,16 @@ gcloud storage ls "gs://dev-.../adjuntos/_control/**/*_resumen.csv"
 # y los *_errores.csv para lo que haya que reintentar
 ```
 
+### Índice maestro de búsqueda (SR → ruta)
+
+Cada archivo procesado sube además su índice a `gs://<bucket>/<prefix>/_index/<nombre>_index.csv` (una fila por adjunto confirmado: `Reference Number`, `FileName`, `StoredAs`, `Location`, `metadata_file`). Concatenando los índices de todos los archivos se obtiene el índice maestro de la migración: localizar los adjuntos de cualquier SR es un filtro por `Reference Number`, sin saber en qué archivo ni máquina se procesó.
+
+```powershell
+# Descargar todos los indices y unirlos en uno maestro:
+gcloud storage cp "gs://dev-.../adjuntos/_index/*_index.csv" .\indices\
+Import-Csv .\indices\*.csv | Export-Csv .\indice_maestro.csv -NoTypeInformation
+```
+
 ## Recomendaciones de capacidad
 
 - **Concurrencia total = suma de `max_workers` de todas las máquinas.** Vigilar que Oracle no devuelva 429/5xx (si pasa, bajar `max_workers`; el circuit breaker frena si el servicio cae).

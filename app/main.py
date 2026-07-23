@@ -234,6 +234,10 @@ HOST = re.sub(r"[^A-Za-z0-9_.-]", "_", socket.gethostname()) or "host"
 
 # Control detallado (opcional): una fila por adjunto — grande con 50k+ adjuntos
 CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status", "Code", "Error"]
+# Indice de busqueda: una fila por adjunto CONFIRMADO en destino (SR -> ruta).
+# Se sube a <prefix>/_index/ en el bucket; concatenando los indices de todos
+# los archivos se obtiene el indice maestro de la migracion.
+INDEX_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "metadata_file"]
 # Resumen por solicitud: conteo de adjuntos cargados por Reference Number
 SR_SUMMARY_COLUMNS = [REFERENCE_COLUMN, "total", "cargados", "downloaded", "skipped_existing", "error"]
 # Resumen compacto por archivo (1 fila): totales + host/job para saber de que proceso salio
@@ -463,7 +467,7 @@ def clear_file_attempts(folder: str, file_name: str) -> None:
 # CSVs de control/resumen que generan los propios jobs: nunca son entrada.
 # Se excluyen del listado para que, si la carpeta de salida coincide con la de
 # entrada (o se apunta por error a ella), no se intenten reprocesar.
-GENERATED_CSV_SUFFIXES = ("_control.csv", "_resumen.csv", "_resumen_sr.csv", "_errores.csv")
+GENERATED_CSV_SUFFIXES = ("_control.csv", "_resumen.csv", "_resumen_sr.csv", "_errores.csv", "_index.csv")
 
 
 def list_csv_files(folder: str) -> list[str]:
@@ -1024,19 +1028,36 @@ def download_metadata_file(
         detail_fh = open(control_path, "w", newline="", encoding="utf-8-sig")
         detail_writer = csv.DictWriter(detail_fh, fieldnames=CONTROL_COLUMNS)
         detail_writer.writeheader()
+    # Indice de busqueda SR -> ruta en destino: solo adjuntos confirmados
+    # (downloaded o skipped_existing), para que nunca apunte a rutas que no
+    # existen. En cada corrida del archivo se regenera completo.
+    index_path = os.path.join(output_folder, f"{base}_index.csv")
+    indexed = 0
     try:
-        for row in entries:
-            crow = control_row(row)
-            if detail_writer:
-                detail_writer.writerow(crow)
-            if crow["Status"] == "error":
-                error_rows.append(crow)
-            stat = sr_stats.setdefault(
-                crow[REFERENCE_COLUMN],
-                {"total": 0, "downloaded": 0, "skipped_existing": 0, "error": 0, "pending": 0},
-            )
-            stat["total"] += 1
-            stat[crow["Status"]] = stat.get(crow["Status"], 0) + 1
+        with open(index_path, "w", newline="", encoding="utf-8-sig") as index_fh:
+            index_writer = csv.DictWriter(index_fh, fieldnames=INDEX_COLUMNS)
+            index_writer.writeheader()
+            for row in entries:
+                crow = control_row(row)
+                if detail_writer:
+                    detail_writer.writerow(crow)
+                if crow["Status"] == "error":
+                    error_rows.append(crow)
+                elif crow["Status"] in ("downloaded", "skipped_existing"):
+                    index_writer.writerow({
+                        REFERENCE_COLUMN: crow[REFERENCE_COLUMN],
+                        "FileName": crow["FileName"],
+                        "StoredAs": crow["StoredAs"],
+                        "Location": crow["Location"],
+                        "metadata_file": file_name,
+                    })
+                    indexed += 1
+                stat = sr_stats.setdefault(
+                    crow[REFERENCE_COLUMN],
+                    {"total": 0, "downloaded": 0, "skipped_existing": 0, "error": 0, "pending": 0},
+                )
+                stat["total"] += 1
+                stat[crow["Status"]] = stat.get(crow["Status"], 0) + 1
     finally:
         if detail_fh:
             detail_fh.close()
@@ -1092,6 +1113,14 @@ def download_metadata_file(
         if uploaded:
             logger.info("Control subido a %s", uploaded)
 
+    # El indice va aparte, bajo <prefix>/_index/ y sin subcarpeta por host: hay
+    # exactamente uno por CSV de metadatos (las particiones son disjuntas), y
+    # concatenarlos todos da el indice maestro SR -> ruta de la migracion.
+    with open(index_path, "rb") as fh:
+        uploaded = storage.upload_index(os.path.basename(index_path), fh.read())
+    if uploaded:
+        logger.info("Indice subido a %s (%d adjuntos)", uploaded, indexed)
+
     # Verificacion: cada adjunto esperado quedo guardado (descargado u omitido
     # por existir). Una subida/escritura que no lanzo excepcion esta confirmada.
     missing = []
@@ -1118,6 +1147,8 @@ def download_metadata_file(
         "run_summary_file": run_summary_path,
         "sr_summary_file": sr_summary_path,
         "errors_file": errors_path,
+        "index_file": index_path,
+        "indexed": indexed,
         "control_file": control_path if detail_control else None,
         "total_rows": len(entries),
         "rows_without_href": no_href,
