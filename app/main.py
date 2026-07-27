@@ -26,7 +26,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -1333,6 +1333,9 @@ class ClobMessagesRequest(BaseModel):
     force: bool = False
     max_workers: Optional[int] = Field(default=None, ge=1, le=64)
     overwrite_html: bool = False  # true = volver a descargar contenidos ya existentes
+    # true = consultar tambien los campos CLOB y generar el <nombre>_clob.csv.
+    # Apagado por defecto: son campos grandes que inflan la respuesta de Oracle.
+    include_clob: bool = False
     # Destino de los contenidos de mensajes: "local" (en output_folder) o "gcp"
     destination: str = "local"
     gcp_bucket: Optional[str] = None  # requerido si destination=gcp
@@ -1366,12 +1369,17 @@ def process_clob_messages_file(
     breaker: CircuitBreaker | None = None,
     storage=None,
     html_types: set[str] | None = None,
+    include_clob: bool = False,
 ) -> dict:
-    """Por cada SR: consulta CLOB + messages, escribe 2 CSV y guarda el contenido.
+    """Por cada SR: consulta los mensajes, escribe el CSV y guarda el contenido.
 
     El contenido de cada mensaje va a un archivo aparte (no inline en el CSV):
     .html si su MessageTypeCd esta en html_types (def. ORA_SVC_RESPONSE), .txt
     en cualquier otro caso. El destino lo decide `storage` (disco o bucket GCP).
+
+    Con include_clob=True se consultan ademas los campos CLOB y se genera el
+    <nombre>_clob.csv. Apagado por defecto: los CLOB son campos grandes y
+    pedirlos infla cada respuesta de Oracle sin necesidad.
 
     Escritura incremental con checkpoint por SR (igual que metadata): si se
     corta, la proxima corrida retoma solo los SR faltantes.
@@ -1381,14 +1389,15 @@ def process_clob_messages_file(
     file_name = os.path.basename(csv_path)
     pairs = read_sr_numbers(csv_path)
     base = os.path.splitext(file_name)[0]
-    clob_path = os.path.join(output_folder, f"{base}_clob.csv")
+    clob_path = os.path.join(output_folder, f"{base}_clob.csv") if include_clob else None
     messages_path = os.path.join(output_folder, f"{base}_messages.csv")
     progress_path = messages_path + ".progress"
+    requested_fields = [*CLOB_FIELDS, "messages"] if include_clob else ["messages"]
 
     done: set[str] = set()
     if force:
         for path in (clob_path, messages_path, progress_path):
-            if os.path.exists(path):
+            if path and os.path.exists(path):
                 os.remove(path)
     elif os.path.isfile(progress_path) and os.path.isfile(messages_path):
         with open(progress_path, encoding="utf-8") as fh:
@@ -1397,8 +1406,9 @@ def process_clob_messages_file(
     pending = [pair for pair in pairs if pair[1] not in done]
     resuming = bool(done)
     logger.info(
-        "Procesando clob+messages %s (%d SR, %d ya hechos, %d pendientes) -> %s",
-        file_name, len(pairs), len(pairs) - len(pending), len(pending), storage.kind,
+        "Procesando mensajes%s %s (%d SR, %d ya hechos, %d pendientes) -> %s",
+        " + clob" if include_clob else "", file_name,
+        len(pairs), len(pairs) - len(pending), len(pending), storage.kind,
     )
     jobs.set_progress(
         job_id,
@@ -1421,12 +1431,12 @@ def process_clob_messages_file(
         sr_id, sr = pair
         if shutdown_event.is_set() or (breaker and breaker.is_open()):
             raise CircuitOpen()
-        data = client.get_sr_fields(sr, [*CLOB_FIELDS, "messages"])
+        data = client.get_sr_fields(sr, requested_fields)
         clob_row = {
             REFERENCE_COLUMN: sr,
             CLOB_FIELDS[0]: decode_clob(data.get(CLOB_FIELDS[0])),
             CLOB_FIELDS[1]: decode_clob(data.get(CLOB_FIELDS[1])),
-        }
+        } if include_clob else None
         message_rows: list[dict] = []
         stats = Counter()
         for msg in data.get("messages") or []:
@@ -1458,16 +1468,21 @@ def process_clob_messages_file(
             message_rows.append(row)
         return pair, clob_row, message_rows, stats
 
-    with open(clob_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as clob_fh, \
-            open(messages_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as msg_fh, \
-            open(progress_path, "a" if resuming else "w", encoding="utf-8") as prog_fh:
-        clob_writer = csv.DictWriter(clob_fh, fieldnames=CLOB_OUTPUT_COLUMNS)
+    mode = "a" if resuming else "w"
+    with ExitStack() as stack:
+        msg_fh = stack.enter_context(open(messages_path, mode, newline="", encoding="utf-8-sig"))
+        prog_fh = stack.enter_context(open(progress_path, mode, encoding="utf-8"))
         msg_writer = csv.DictWriter(msg_fh, fieldnames=MESSAGE_OUTPUT_COLUMNS)
+        clob_fh = clob_writer = None
+        if include_clob:
+            clob_fh = stack.enter_context(open(clob_path, mode, newline="", encoding="utf-8-sig"))
+            clob_writer = csv.DictWriter(clob_fh, fieldnames=CLOB_OUTPUT_COLUMNS)
         if not resuming:
-            clob_writer.writeheader()
             msg_writer.writeheader()
-            clob_fh.flush()
             msg_fh.flush()
+            if clob_writer:
+                clob_writer.writeheader()
+                clob_fh.flush()
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(process_sr, pair): pair for pair in pending}
@@ -1495,8 +1510,9 @@ def process_clob_messages_file(
                 if breaker:
                     breaker.record_success()
                 with write_lock:
-                    clob_writer.writerow(clob_row)
-                    clob_fh.flush()
+                    if clob_writer:
+                        clob_writer.writerow(clob_row)
+                        clob_fh.flush()
                     if message_rows:
                         msg_writer.writerows(message_rows)
                         msg_fh.flush()
@@ -1543,9 +1559,9 @@ def process_clob_messages_file(
             logger.info("Indice de mensajes subido a %s (%d mensajes)", index_location, message_count)
 
     logger.info(
-        "Generado %s_clob.csv y %s_messages.csv (%d mensajes: %d html, %d txt, %d ya existentes; %d errores)",
-        base, base, message_count, saved_by_format.get("html", 0), saved_by_format.get("txt", 0),
-        skipped_existing, len(errors),
+        "Generado %s_messages.csv%s (%d mensajes: %d html, %d txt, %d ya existentes; %d errores)",
+        base, f" y {base}_clob.csv" if include_clob else "", message_count,
+        saved_by_format.get("html", 0), saved_by_format.get("txt", 0), skipped_existing, len(errors),
     )
     return {
         "input_file": file_name,
@@ -1574,6 +1590,7 @@ def run_clob_messages_job(
     overwrite_html: bool,
     storage=None,
     html_types: set[str] | None = None,
+    include_clob: bool = False,
 ) -> None:
     max_workers = max_workers or config.get_max_workers()
     breaker = CircuitBreaker(config.get_circuit_threshold())
@@ -1585,7 +1602,7 @@ def run_clob_messages_job(
             try:
                 result = process_clob_messages_file(
                     client, csv_path, output_folder, max_workers, job_id, force, overwrite_html,
-                    breaker, storage, html_types,
+                    breaker, storage, html_types, include_clob,
                 )
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
@@ -1703,7 +1720,7 @@ def get_metadata_clob_and_messages(request: ClobMessagesRequest):
     start_job_thread(
         run_clob_messages_job,
         (job["job_id"], client, batch, request.output_folder, request.force, effective_workers,
-         request.overwrite_html, storage, html_types),
+         request.overwrite_html, storage, html_types, request.include_clob),
     )
     return {
         "job_id": job["job_id"],

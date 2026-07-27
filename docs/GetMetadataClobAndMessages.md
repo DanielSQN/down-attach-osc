@@ -1,6 +1,8 @@
 # POST /GetMetadataClobAndMessages
 
-Por cada `Reference Number` de los archivos de entrada, consulta en Oracle los campos CLOB (`arin_comentarios_cifrado_c`, `col_tex_plantilla_c`) y el array `messages`, y genera **dos CSV por archivo de entrada** más un archivo **`.html` o `.txt` por cada mensaje** (la extensión la define el `MessageTypeCd`). Los contenidos pueden guardarse en **disco local o subirse a un bucket de GCP**.
+Por cada `Reference Number` de los archivos de entrada, consulta en Oracle el array `messages` y genera **un CSV por archivo de entrada** más un archivo **`.html` o `.txt` por cada mensaje** (la extensión la define el `MessageTypeCd`). Los contenidos pueden guardarse en **disco local o subirse a un bucket de GCP**.
+
+Los campos CLOB (`arin_comentarios_cifrado_c`, `col_tex_plantilla_c`) **ya no se consultan por defecto**: son campos grandes que inflan cada respuesta de Oracle. Se pueden reactivar con `include_clob: true` (genera el `<nombre>_clob.csv` como antes).
 
 Es **asíncrono**: responde con un `job_id`; el avance y el resultado se consultan en [`GET /jobs/{job_id}`](Jobs.md).
 
@@ -11,7 +13,8 @@ Es **asíncrono**: responde con un `job_id`; el avance y el resultado se consult
 
 Por cada SR:
 
-1. `GET /crmRestApi/resources/11.13.18.05/serviceRequests/<srNumber>?fields=arin_comentarios_cifrado_c,col_tex_plantilla_c,messages&onlyData=true`
+1. `GET /crmRestApi/resources/11.13.18.05/serviceRequests/<srNumber>?fields=messages&onlyData=true`
+   (con `include_clob: true`: `?fields=arin_comentarios_cifrado_c,col_tex_plantilla_c,messages&onlyData=true`)
 2. Por cada mensaje del array `messages`: `GET .../serviceRequests/<srNumber>/child/messages/<MessageId>/enclosure/MessageContent`
 
 ## Petición (body)
@@ -25,6 +28,7 @@ Por cada SR:
 | `force` | booleano | No | `false` | `true` = reprocesa desde cero (borra CSVs y checkpoint del lote). |
 | `max_workers` | entero (1–64) | No | `OSC_MAX_WORKERS` | SR en paralelo solo para este job. |
 | `overwrite_html` | booleano | No | `false` | `true` = vuelve a guardar los contenidos ya existentes en destino. |
+| `include_clob` | booleano | No | `false` | `true` = consulta además los campos CLOB y genera el `<nombre>_clob.csv`. |
 | `destination` | string | No | `"local"` | `"local"` (en `output_folder`) o `"gcp"` (bucket). |
 | `gcp_bucket` | string | Si `gcp` | — | Bucket destino de los contenidos. |
 | `gcp_prefix` | string | No | `""` | Prefijo dentro del bucket. |
@@ -57,7 +61,7 @@ Igual que los otros métodos: `job_id`, `status: "running"`, `files_in_batch`, `
 
 ## Archivos generados (por cada archivo de entrada)
 
-### `<nombre>_clob.csv`
+### `<nombre>_clob.csv` — solo con `include_clob: true`
 
 Una fila por SR, con los CLOB **decodificados a texto** (vienen en base64; si el campo es `null` queda vacío):
 
@@ -99,7 +103,7 @@ La extensión la decide el **`MessageTypeCd`** del mensaje:
 
 ## Resultado del job
 
-Al terminar, `result.summary` = `{ files, expected_srs, consulted, failed_srs, messages, html_saved, txt_saved, skipped_existing, all_ok }`. Cada archivo en `result.results` trae `clob_file`, `messages_file`, `index_location` (URI del índice en el bucket, `null` en local), `destination`, `service_requests`, `resumed_srs`, `messages`, `html_saved`, `txt_saved`, `skipped_existing`, `errors` y `verification` (`{ expected_srs, consulted, failed, ok }`).
+Al terminar, `result.summary` = `{ files, expected_srs, consulted, failed_srs, messages, html_saved, txt_saved, skipped_existing, all_ok }`. Cada archivo en `result.results` trae `clob_file` (`null` sin `include_clob`), `messages_file`, `index_location` (URI del índice en el bucket, `null` en local), `destination`, `service_requests`, `resumed_srs`, `messages`, `html_saved`, `txt_saved`, `skipped_existing`, `errors` y `verification` (`{ expected_srs, consulted, failed, ok }`).
 
 ## Reanudación y robustez
 
