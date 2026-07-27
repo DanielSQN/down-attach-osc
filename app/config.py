@@ -59,6 +59,16 @@ def get_gcp_service_account_file() -> str:
     return os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip()
 
 
+def get_html_message_types() -> set[str]:
+    """MessageTypeCd cuyo contenido se guarda como .html; el resto va como .txt.
+
+    De las pruebas contra Oracle, ORA_SVC_RESPONSE es el unico que devuelve HTML.
+    Se puede ajustar con OSC_HTML_MESSAGE_TYPES (lista separada por comas).
+    """
+    raw = os.getenv("OSC_HTML_MESSAGE_TYPES", "ORA_SVC_RESPONSE")
+    return {t.strip().upper() for t in raw.split(",") if t.strip()}
+
+
 def get_max_file_attempts() -> int:
     """Corridas completas con errores persistentes tras las cuales un archivo
     se da por terminado igual, para no reprocesarlo indefinidamente (0 = nunca)."""

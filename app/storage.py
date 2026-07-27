@@ -38,7 +38,7 @@ class LocalStorage:
     def exists(self, rel: str) -> bool:
         return os.path.exists(self._full(rel))
 
-    def sink(self, rel: str):
+    def sink(self, rel: str, content_type: str | None = None):
         path = self._full(rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = f"{path}.part"
@@ -127,7 +127,7 @@ class GcpStorage:
             return name in self._existing
         return self.bucket.blob(name).exists()
 
-    def sink(self, rel: str):
+    def sink(self, rel: str, content_type: str | None = None):
         blob = self.bucket.blob(self._name(rel))
 
         def _upload(response) -> None:
@@ -142,7 +142,11 @@ class GcpStorage:
                 size = buf.tell()
                 buf.seek(0)
                 blob.upload_from_file(
-                    buf, size=size, content_type=response.headers.get("Content-Type")
+                    buf,
+                    size=size,
+                    # content_type explicito (p. ej. text/html o text/plain para el
+                    # contenido de mensajes); si no, el que declare la respuesta
+                    content_type=content_type or response.headers.get("Content-Type"),
                 )
             if self._existing is not None:
                 self._existing.add(blob.name)

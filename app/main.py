@@ -263,9 +263,22 @@ MESSAGE_FIELDS = [
     "NotificationProcessingStatusCd",
     "TemplateName",
 ]
-MESSAGE_CONTENT_COLUMN = "MessageContent"  # ruta al archivo HTML guardado
-MESSAGE_OUTPUT_COLUMNS = [*MESSAGE_FIELDS, MESSAGE_CONTENT_COLUMN]
-MESSAGE_CONTENT_DIR = "message_content"  # subcarpeta de HTMLs, por SR
+MESSAGE_CONTENT_COLUMN = "MessageContent"  # ruta relativa del archivo guardado
+MESSAGE_FORMAT_COLUMN = "ContentFormat"  # "html" o "txt", segun MessageTypeCd
+MESSAGE_LOCATION_COLUMN = "Location"  # ruta completa en destino (gs://... o local)
+MESSAGE_OUTPUT_COLUMNS = [
+    *MESSAGE_FIELDS, MESSAGE_CONTENT_COLUMN, MESSAGE_FORMAT_COLUMN, MESSAGE_LOCATION_COLUMN,
+]
+MESSAGE_CONTENT_DIR = "message_content"  # subcarpeta de contenidos, por SR
+
+# El contenido de un mensaje se guarda como .html o .txt segun su MessageTypeCd:
+# solo los tipos configurados (por defecto ORA_SVC_RESPONSE, el unico que Oracle
+# devuelve como HTML en las pruebas) van como HTML; el resto son texto plano.
+CONTENT_TYPE_BY_FORMAT = {"html": "text/html; charset=utf-8", "txt": "text/plain; charset=utf-8"}
+
+
+def message_content_format(message_type: str, html_types: set[str]) -> str:
+    return "html" if (message_type or "").strip().upper() in html_types else "txt"
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -467,7 +480,10 @@ def clear_file_attempts(folder: str, file_name: str) -> None:
 # CSVs de control/resumen que generan los propios jobs: nunca son entrada.
 # Se excluyen del listado para que, si la carpeta de salida coincide con la de
 # entrada (o se apunta por error a ella), no se intenten reprocesar.
-GENERATED_CSV_SUFFIXES = ("_control.csv", "_resumen.csv", "_resumen_sr.csv", "_errores.csv", "_index.csv")
+GENERATED_CSV_SUFFIXES = (
+    "_control.csv", "_resumen.csv", "_resumen_sr.csv", "_errores.csv", "_index.csv",
+    "_clob.csv", "_messages.csv",
+)
 
 
 def list_csv_files(folder: str) -> list[str]:
@@ -858,8 +874,12 @@ class BinaryRequest(BaseModel):
         return self
 
 
-def build_storage(request: "BinaryRequest", pool_size: int = 10):
-    """Crea el backend de almacenamiento segun destination (valida credenciales)."""
+def build_storage(request, pool_size: int = 10):
+    """Crea el backend de almacenamiento segun destination (valida credenciales).
+
+    Sirve para BinaryRequest (binarios de adjuntos) y ClobMessagesRequest
+    (contenidos de mensajes): ambos traen destination/gcp_bucket/gcp_prefix.
+    """
     if request.destination == "gcp":
         try:
             return GcpStorage(
@@ -1312,7 +1332,14 @@ class ClobMessagesRequest(BaseModel):
     batch_size: int = 10
     force: bool = False
     max_workers: Optional[int] = Field(default=None, ge=1, le=64)
-    overwrite_html: bool = False  # true = volver a descargar HTMLs ya existentes
+    overwrite_html: bool = False  # true = volver a descargar contenidos ya existentes
+    # Destino de los contenidos de mensajes: "local" (en output_folder) o "gcp"
+    destination: str = "local"
+    gcp_bucket: Optional[str] = None  # requerido si destination=gcp
+    gcp_prefix: str = ""  # prefijo opcional dentro del bucket
+    # MessageTypeCd que se guardan como .html; el resto como .txt.
+    # Si no se envia, se usa OSC_HTML_MESSAGE_TYPES (def. ORA_SVC_RESPONSE).
+    html_message_types: Optional[list[str]] = None
     # Particion multi-maquina
     worker_index: int = Field(default=0, ge=0)
     worker_count: int = Field(default=1, ge=1)
@@ -1321,6 +1348,10 @@ class ClobMessagesRequest(BaseModel):
     def _validate_worker(self):
         if self.worker_index >= self.worker_count:
             raise ValueError("worker_index debe ser menor que worker_count")
+        if self.destination not in ("local", "gcp"):
+            raise ValueError("destination debe ser 'local' o 'gcp'")
+        if self.destination == "gcp" and not self.gcp_bucket:
+            raise ValueError("gcp_bucket es requerido cuando destination='gcp'")
         return self
 
 
@@ -1333,19 +1364,26 @@ def process_clob_messages_file(
     force: bool,
     overwrite_html: bool,
     breaker: CircuitBreaker | None = None,
+    storage=None,
+    html_types: set[str] | None = None,
 ) -> dict:
-    """Por cada SR: consulta CLOB + messages, escribe 2 CSV y baja los HTML.
+    """Por cada SR: consulta CLOB + messages, escribe 2 CSV y guarda el contenido.
+
+    El contenido de cada mensaje va a un archivo aparte (no inline en el CSV):
+    .html si su MessageTypeCd esta en html_types (def. ORA_SVC_RESPONSE), .txt
+    en cualquier otro caso. El destino lo decide `storage` (disco o bucket GCP).
 
     Escritura incremental con checkpoint por SR (igual que metadata): si se
     corta, la proxima corrida retoma solo los SR faltantes.
     """
+    storage = storage or LocalStorage(output_folder)
+    html_types = html_types if html_types is not None else config.get_html_message_types()
     file_name = os.path.basename(csv_path)
     pairs = read_sr_numbers(csv_path)
     base = os.path.splitext(file_name)[0]
     clob_path = os.path.join(output_folder, f"{base}_clob.csv")
     messages_path = os.path.join(output_folder, f"{base}_messages.csv")
     progress_path = messages_path + ".progress"
-    html_root = os.path.join(output_folder, MESSAGE_CONTENT_DIR)
 
     done: set[str] = set()
     if force:
@@ -1359,8 +1397,8 @@ def process_clob_messages_file(
     pending = [pair for pair in pairs if pair[1] not in done]
     resuming = bool(done)
     logger.info(
-        "Procesando clob+messages %s (%d SR, %d ya hechos, %d pendientes)",
-        file_name, len(pairs), len(pairs) - len(pending), len(pending),
+        "Procesando clob+messages %s (%d SR, %d ya hechos, %d pendientes) -> %s",
+        file_name, len(pairs), len(pairs) - len(pending), len(pending), storage.kind,
     )
     jobs.set_progress(
         job_id,
@@ -1370,9 +1408,14 @@ def process_clob_messages_file(
         current_file_done=len(pairs) - len(pending),
     )
 
+    # Precarga (en GCP: lista el prefijo una vez) para omitir lo ya subido
+    storage.preload()
+
     errors: list[dict] = []
     write_lock = threading.Lock()
     message_count = 0
+    saved_by_format = Counter()
+    skipped_existing = 0
 
     def process_sr(pair: tuple[str, str]):
         sr_id, sr = pair
@@ -1385,20 +1428,35 @@ def process_clob_messages_file(
             CLOB_FIELDS[1]: decode_clob(data.get(CLOB_FIELDS[1])),
         }
         message_rows: list[dict] = []
+        stats = Counter()
         for msg in data.get("messages") or []:
             row = {field: msg.get(field, "") for field in MESSAGE_FIELDS}
             message_id = str(msg.get("MessageId", "")).strip()
             if message_id:
-                sr_dir = os.path.join(html_root, sanitize_filename(sr))
-                os.makedirs(sr_dir, exist_ok=True)
-                html_path = os.path.join(sr_dir, f"{sanitize_filename(message_id)}.html")
-                if not (os.path.exists(html_path) and not overwrite_html):
-                    client.download_binary(client.message_content_url(sr, message_id), html_path)
-                row[MESSAGE_CONTENT_COLUMN] = os.path.relpath(html_path, output_folder)
+                # La extension la define el MessageTypeCd: HTML solo para los
+                # tipos configurados; el resto se guarda como texto plano.
+                fmt = message_content_format(msg.get("MessageTypeCd"), html_types)
+                rel = (
+                    f"{MESSAGE_CONTENT_DIR}/{target_subdir(sr)}"
+                    f"/{sanitize_filename(message_id)}.{fmt}"
+                )
+                if storage.exists(rel) and not overwrite_html:
+                    stats["skipped"] += 1
+                else:
+                    client.stream_binary(
+                        client.message_content_url(sr, message_id),
+                        storage.sink(rel, content_type=CONTENT_TYPE_BY_FORMAT[fmt]),
+                    )
+                    stats[fmt] += 1
+                row[MESSAGE_CONTENT_COLUMN] = rel
+                row[MESSAGE_FORMAT_COLUMN] = fmt
+                row[MESSAGE_LOCATION_COLUMN] = storage.location(rel)
             else:
                 row[MESSAGE_CONTENT_COLUMN] = ""
+                row[MESSAGE_FORMAT_COLUMN] = ""
+                row[MESSAGE_LOCATION_COLUMN] = ""
             message_rows.append(row)
-        return pair, clob_row, message_rows
+        return pair, clob_row, message_rows, stats
 
     with open(clob_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as clob_fh, \
             open(messages_path, "a" if resuming else "w", newline="", encoding="utf-8-sig") as msg_fh, \
@@ -1419,7 +1477,7 @@ def process_clob_messages_file(
                     break
                 sr_id, sr = futures[future]
                 try:
-                    _, clob_row, message_rows = future.result()
+                    _, clob_row, message_rows, sr_stats = future.result()
                 except CircuitOpen:
                     continue
                 except Exception as exc:
@@ -1445,6 +1503,8 @@ def process_clob_messages_file(
                     prog_fh.write(sr + "\n")
                     prog_fh.flush()
                     message_count += len(message_rows)
+                    saved_by_format.update(sr_stats)
+                    skipped_existing += sr_stats.get("skipped", 0)
                 jobs.increment(job_id, "srs_consulted")
                 jobs.increment(job_id, "current_file_done")
 
@@ -1470,15 +1530,35 @@ def process_clob_messages_file(
             file_name, len(errors), len(pairs),
         )
 
-    logger.info("Generado %s_clob.csv y %s_messages.csv (%d mensajes, %d errores)",
-                base, base, message_count, len(errors))
+    # El CSV de mensajes ES el indice: trae la metadata de cada mensaje mas su
+    # ruta en destino (MessageContent/Location). Con destino GCP se sube a
+    # <prefix>/_index/ para consultarlo junto a los contenidos, sin depender de
+    # la maquina que proceso el archivo. Solo se sube si el archivo quedo
+    # completo (sin errores reintentables); si no, se subiria un indice parcial.
+    index_location = None
+    if not errors or errors_all_permanent(errors):
+        with open(messages_path, "rb") as fh:
+            index_location = storage.upload_index(os.path.basename(messages_path), fh.read())
+        if index_location:
+            logger.info("Indice de mensajes subido a %s (%d mensajes)", index_location, message_count)
+
+    logger.info(
+        "Generado %s_clob.csv y %s_messages.csv (%d mensajes: %d html, %d txt, %d ya existentes; %d errores)",
+        base, base, message_count, saved_by_format.get("html", 0), saved_by_format.get("txt", 0),
+        skipped_existing, len(errors),
+    )
     return {
         "input_file": file_name,
         "clob_file": clob_path,
         "messages_file": messages_path,
+        "index_location": index_location,
+        "destination": storage.kind,
         "service_requests": len(pairs),
         "resumed_srs": len(pairs) - len(pending),
         "messages": message_count,
+        "html_saved": saved_by_format.get("html", 0),
+        "txt_saved": saved_by_format.get("txt", 0),
+        "skipped_existing": skipped_existing,
         "errors": errors,
         "verification": verification,
     }
@@ -1492,6 +1572,8 @@ def run_clob_messages_job(
     force: bool,
     max_workers: int | None,
     overwrite_html: bool,
+    storage=None,
+    html_types: set[str] | None = None,
 ) -> None:
     max_workers = max_workers or config.get_max_workers()
     breaker = CircuitBreaker(config.get_circuit_threshold())
@@ -1502,7 +1584,8 @@ def run_clob_messages_job(
             file_name = os.path.basename(csv_path)
             try:
                 result = process_clob_messages_file(
-                    client, csv_path, output_folder, max_workers, job_id, force, overwrite_html, breaker
+                    client, csv_path, output_folder, max_workers, job_id, force, overwrite_html,
+                    breaker, storage, html_types,
                 )
             except ShutdownRequested:
                 logger.info("Job %s interrumpido por apagado del servidor en %s", job_id, file_name)
@@ -1534,6 +1617,7 @@ def run_clob_messages_job(
                     "job_id": job_id,
                     "clob_file": result.get("clob_file", ""),
                     "messages_file": result.get("messages_file", ""),
+                    "index_location": result.get("index_location"),
                     "service_requests": result.get("service_requests", 0),
                     "messages": result.get("messages", 0),
                 },
@@ -1545,6 +1629,9 @@ def run_clob_messages_job(
             "consulted": sum(r.get("verification", {}).get("consulted", 0) for r in results),
             "failed_srs": sum(len(r.get("errors", [])) for r in results),
             "messages": sum(r.get("messages", 0) for r in results),
+            "html_saved": sum(r.get("html_saved", 0) for r in results),
+            "txt_saved": sum(r.get("txt_saved", 0) for r in results),
+            "skipped_existing": sum(r.get("skipped_existing", 0) for r in results),
             "all_ok": all(r.get("verification", {}).get("ok", False) for r in results),
         }
         jobs.finish(
@@ -1568,6 +1655,12 @@ def get_metadata_clob_and_messages(request: ClobMessagesRequest):
     effective_workers = request.max_workers or config.get_max_workers()
     client = build_client(pool_size=effective_workers)
     os.makedirs(request.output_folder, exist_ok=True)
+    storage = build_storage(request, pool_size=effective_workers)  # valida credenciales/bucket
+    html_types = (
+        {t.strip().upper() for t in request.html_message_types if t.strip()}
+        if request.html_message_types is not None
+        else config.get_html_message_types()
+    )
     if request.files:
         batch = [os.path.join(request.input_folder, name) for name in request.files]
         missing = [name for name, path in zip(request.files, batch) if not os.path.isfile(path)]
@@ -1605,10 +1698,12 @@ def get_metadata_clob_and_messages(request: ClobMessagesRequest):
         pending_after_batch=pending_after,
         srs_consulted=0,
         sr_errors=0,
+        destination=storage.kind,
     )
     start_job_thread(
         run_clob_messages_job,
-        (job["job_id"], client, batch, request.output_folder, request.force, effective_workers, request.overwrite_html),
+        (job["job_id"], client, batch, request.output_folder, request.force, effective_workers,
+         request.overwrite_html, storage, html_types),
     )
     return {
         "job_id": job["job_id"],
