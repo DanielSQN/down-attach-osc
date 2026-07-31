@@ -856,6 +856,11 @@ class BinaryRequest(BaseModel):
     destination: str = "local"
     gcp_bucket: Optional[str] = None  # requerido si destination=gcp
     gcp_prefix: str = ""  # prefijo opcional dentro del bucket
+    # false = no listar el bucket al arrancar; se verifica objeto por objeto.
+    # Util cuando el prefijo tiene millones de objetos y el listado tarda mas
+    # que las comprobaciones puntuales (que ademas corren en paralelo).
+    preload_listing: bool = True
+    refresh_listing: bool = False  # true = re-listar aunque el proceso ya tenga el listado
     detail_control: bool = False  # true = genera el _control.csv fila-por-adjunto (grande)
     # Particion multi-maquina (solo con metadata_folder)
     worker_index: int = Field(default=0, ge=0)
@@ -887,6 +892,8 @@ def build_storage(request, pool_size: int = 10):
                 prefix=request.gcp_prefix,
                 credentials_file=config.get_gcp_service_account_file(),
                 pool_size=pool_size,
+                preload_listing=getattr(request, "preload_listing", True),
+                refresh_listing=getattr(request, "refresh_listing", False),
             )
         except ImportError:
             raise HTTPException(
@@ -1340,6 +1347,8 @@ class ClobMessagesRequest(BaseModel):
     destination: str = "local"
     gcp_bucket: Optional[str] = None  # requerido si destination=gcp
     gcp_prefix: str = ""  # prefijo opcional dentro del bucket
+    preload_listing: bool = True  # false = verificar objeto por objeto, sin listar el prefijo
+    refresh_listing: bool = False  # true = re-listar aunque el proceso ya tenga el listado
     # MessageTypeCd que se guardan como .html; el resto como .txt.
     # Si no se envia, se usa OSC_HTML_MESSAGE_TYPES (def. ORA_SVC_RESPONSE).
     html_message_types: Optional[list[str]] = None

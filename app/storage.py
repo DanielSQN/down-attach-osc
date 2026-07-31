@@ -13,12 +13,27 @@ del destino:
 import logging
 import os
 import tempfile
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
 CHUNK = 1024 * 256
 # Buffer de subida a GCP: hasta este tamaño va en memoria; por encima, a disco temporal
 SPOOL_MAX = 16 * 1024 * 1024
+
+# Listado de objetos ya presentes en el bucket, compartido por TODOS los jobs
+# del proceso y por (bucket, prefix). Con millones de objetos el listado tarda
+# minutos: pagarlo una vez por servidor (y no una vez por job) es la diferencia
+# entre arrancar en segundos o esperar el listado completo en cada llamada.
+_listing_cache: dict[tuple[str, str], set[str]] = {}
+_listing_locks: dict[tuple[str, str], threading.Lock] = {}
+_listing_guard = threading.Lock()
+
+
+def _listing_lock_for(key: tuple[str, str]) -> threading.Lock:
+    with _listing_guard:
+        return _listing_locks.setdefault(key, threading.Lock())
 
 
 class LocalStorage:
@@ -78,7 +93,15 @@ class GcpStorage:
 
     kind = "gcp"
 
-    def __init__(self, bucket: str, prefix: str = "", credentials_file: str = "", pool_size: int = 10):
+    def __init__(
+        self,
+        bucket: str,
+        prefix: str = "",
+        credentials_file: str = "",
+        pool_size: int = 10,
+        preload_listing: bool = True,
+        refresh_listing: bool = False,
+    ):
         # Import perezoso: solo se necesita google-cloud-storage si se usa GCP
         from google.cloud import storage as gcs
 
@@ -101,6 +124,8 @@ class GcpStorage:
             pass
         self.bucket = self.client.bucket(bucket)
         self.prefix = (prefix or "").strip("/")
+        self.preload_listing = preload_listing
+        self.refresh_listing = refresh_listing
         self._existing: set[str] | None = None
 
     def _name(self, rel: str) -> str:
@@ -108,18 +133,64 @@ class GcpStorage:
         return f"{self.prefix}/{rel}" if self.prefix else rel
 
     def preload(self) -> None:
-        # Un solo listado del prefijo (paginado) en vez de un HEAD por objeto;
-        # sirve para omitir en la reanudacion lo que ya esta en el bucket.
-        # Se lista UNA vez por job (no por archivo del lote): con millones de
-        # objetos re-listar por archivo es carisimo. Las subidas de este job
-        # se van agregando al set en sink(), asi que sigue al dia.
+        """Carga el listado de objetos ya presentes, para omitir lo ya subido.
+
+        Un solo listado del prefijo (paginado) en vez de un HEAD por objeto, y
+        compartido entre todos los jobs del proceso: con millones de objetos el
+        listado tarda minutos y repetirlo por job bloquea el arranque. Las
+        subidas propias se agregan al set en sink(), asi que sigue al dia.
+
+        Con preload_listing=False no se lista: exists() hace un HEAD por objeto
+        (util cuando el prefijo es enorme y el listado tarda mas que las
+        comprobaciones puntuales, que ademas corren en paralelo).
+        """
         if self._existing is not None:
             return
-        names = set()
-        for blob in self.client.list_blobs(self.bucket, prefix=self.prefix or None):
-            names.add(blob.name)
-        self._existing = names
-        logger.info("GCP: %d objetos ya presentes bajo gs://%s/%s", len(names), self.bucket.name, self.prefix)
+        if not self.preload_listing:
+            logger.info(
+                "GCP: sin listado previo (preload_listing=false); se verifica objeto por objeto"
+            )
+            return
+        key = (self.bucket.name, self.prefix)
+        # Un lock por (bucket, prefix): si varios jobs arrancan a la vez, solo
+        # uno lista y los demas esperan y reutilizan ese mismo set.
+        with _listing_lock_for(key):
+            cached = _listing_cache.get(key)
+            if cached is not None and not self.refresh_listing:
+                self._existing = cached
+                logger.info(
+                    "GCP: %d objetos ya presentes bajo gs://%s/%s (listado en cache del proceso)",
+                    len(cached), self.bucket.name, self.prefix,
+                )
+                return
+            start = time.monotonic()
+            logger.info(
+                "GCP: listando objetos bajo gs://%s/%s (puede tardar varios minutos "
+                "con millones de objetos)...", self.bucket.name, self.prefix,
+            )
+            names: set[str] = set()
+            # fields limita la respuesta al nombre: sin esto el API devuelve toda
+            # la metadata de cada objeto (tamano, hashes, fechas...), varias veces
+            # mas bytes que parsear en un listado de millones.
+            blobs = self.client.list_blobs(
+                self.bucket,
+                prefix=self.prefix or None,
+                fields="items(name),nextPageToken",
+                page_size=1000,
+            )
+            for blob in blobs:
+                names.add(blob.name)
+                if len(names) % 250_000 == 0:
+                    logger.info(
+                        "GCP: %d objetos listados (%.1f min)...",
+                        len(names), (time.monotonic() - start) / 60,
+                    )
+            _listing_cache[key] = names
+            self._existing = names
+            logger.info(
+                "GCP: %d objetos ya presentes bajo gs://%s/%s (listado en %.1f min)",
+                len(names), self.bucket.name, self.prefix, (time.monotonic() - start) / 60,
+            )
 
     def exists(self, rel: str) -> bool:
         name = self._name(rel)

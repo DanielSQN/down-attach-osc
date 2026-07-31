@@ -21,6 +21,8 @@ Debe enviarse **exactamente uno** de `metadata_csv` o `metadata_folder`.
 | `output_folder` | string | Sí | — | Carpeta raíz donde se guardan los binarios (una subcarpeta por `Reference Number`). Se crea si no existe. Aquí también vive el manifiesto `_downloaded_files.json`. |
 | `batch_size` | entero | No | `10` | Máximo de CSVs de metadatos pendientes a tomar. `0` = todos. Solo aplica con `metadata_folder`. |
 | `overwrite` | booleano | No | `false` | `true` = volver a descargar y sobrescribir binarios que ya existen en disco. Con `false` se omiten (`skipped_existing`), lo que hace baratos los reintentos. |
+| `preload_listing` | booleano | No | `true` | Solo GCP. `false` = no listar el prefijo al arrancar; se verifica objeto por objeto (útil si el prefijo tiene millones de objetos). |
+| `refresh_listing` | booleano | No | `false` | Solo GCP. `true` = re-listar aunque el proceso ya tenga el listado en caché. |
 | `force` | booleano | No | `false` | `true` = ignorar el manifiesto `_downloaded_files.json` y volver a tomar todos los CSVs de la carpeta. Solo aplica con `metadata_folder`. |
 | `max_workers` | entero (1–64) | No | `OSC_MAX_WORKERS` | Descargas en paralelo solo para este job, sin editar el `.env`. |
 | `destination` | string | No | `"local"` | Destino de los binarios: `"local"` (guarda en `output_folder`) o `"gcp"` (sube a un bucket de GCP). |
@@ -36,7 +38,9 @@ Con `destination: "gcp"` el binario se transmite **directamente desde Oracle al 
 GCP_SERVICE_ACCOUNT_FILE=C:\\ruta\\cuenta-servicio.json
 ```
 
-Si se deja vacío, usa las credenciales por defecto de GCP (ADC / `GOOGLE_APPLICATION_CREDENTIALS`). El `output_folder` sigue siendo obligatorio: ahí viven el manifiesto `_downloaded_files.json` y los checkpoints (los binarios NO se guardan en local). Para la reanudación, se lista **una sola vez por job** el prefijo del bucket y se omiten los objetos ya presentes (`skipped_existing`); las subidas del propio job se registran en memoria, así que no hace falta re-listar entre archivos.
+Si se deja vacío, usa las credenciales por defecto de GCP (ADC / `GOOGLE_APPLICATION_CREDENTIALS`). El `output_folder` sigue siendo obligatorio: ahí viven el manifiesto `_downloaded_files.json` y los checkpoints (los binarios NO se guardan en local). Para la reanudación se lista el prefijo del bucket y se omiten los objetos ya presentes (`skipped_existing`). Ese listado se hace **una sola vez por proceso del servidor** (compartido por todos los jobs, cacheado por `bucket+prefix`) y las subidas propias se registran en memoria, así que no se re-lista entre archivos ni entre jobs.
+
+> **Con millones de objetos el listado inicial tarda minutos** y el job arranca sin registrar avance mientras corre (verás en el log `GCP: listando objetos bajo gs://...` y luego el progreso cada 250.000). Solo lo paga el primer job después de arrancar el servidor. Si el prefijo es tan grande que el listado se vuelve inviable, usar `preload_listing: false`: no lista nada y verifica objeto por objeto (un HEAD por adjunto, en paralelo con las descargas). Con `refresh_listing: true` se fuerza un listado nuevo aunque el proceso ya tenga uno en caché.
 
 > Requiere la dependencia `google-cloud-storage` (incluida en `requirements.txt`). Si falta, `destination=gcp` responde 500.
 >
