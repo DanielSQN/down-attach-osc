@@ -49,6 +49,8 @@ gcloud storage ls "gs://dev-.../adjuntos/_control/**/*_resumen.csv"
 # y los *_errores.csv para lo que haya que reintentar
 ```
 
+El procedimiento completo de cierre (índice maestro, gran total, lo no migrado y el cuadre) está en [ConsolidadoFinal.md](ConsolidadoFinal.md).
+
 ### Índice maestro de búsqueda (SR → ruta)
 
 Cada archivo procesado sube además su índice a `gs://<bucket>/<prefix>/_index/<nombre>_index.csv` (una fila por adjunto confirmado: `Reference Number`, `FileName`, `StoredAs`, `Location`, `metadata_file`). Concatenando los índices de todos los archivos se obtiene el índice maestro de la migración: localizar los adjuntos de cualquier SR es un filtro por `Reference Number`, sin saber en qué archivo ni máquina se procesó.

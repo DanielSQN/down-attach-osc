@@ -24,6 +24,7 @@ Especificación campo a campo de cada método (petición, respuesta, errores y a
 - [docs/ValidarReferenceNumber.md](docs/ValidarReferenceNumber.md) — cómo validar desde Windows si un Reference Number quedó en los archivos de metadata
 - [docs/GCP_CuentaDeServicio.md](docs/GCP_CuentaDeServicio.md) — configurar la subida a un bucket de GCP (cuenta de servicio, permisos, JSON, red)
 - [docs/MultiMaquina.md](docs/MultiMaquina.md) — procesar muchos archivos en varias máquinas (partición por worker, comportamiento con GCP)
+- [docs/ConsolidadoFinal.md](docs/ConsolidadoFinal.md) — cerrar la migración: índice maestro de búsqueda, gran total, lo no migrado y el cuadre final
 
 ## Estrategia de lotes y reanudación
 
