@@ -84,7 +84,7 @@ Una fila por mensaje de cada SR:
 
 Un mensaje sin `MessageId` no tiene contenido descargable: sus tres columnas quedan vacías y la fila se conserva con su metadata.
 
-**Este CSV es el índice**: trae la metadata de cada mensaje **más la ruta donde quedó su contenido**. Con `destination=gcp` se sube además a `gs://<bucket>/<prefix>/_index/<nombre>_messages.csv` al terminar el archivo, para consultarlo junto a los contenidos sin depender de la máquina que lo procesó. Solo se sube si el archivo quedó completo (sin errores reintentables), para no publicar un índice parcial.
+**Este CSV es el índice**: trae la metadata de cada mensaje **más la ruta donde quedó su contenido**. Con `destination=gcp` se sube además a `gs://<bucket>/<prefix>/_index/<nombre>_messages.csv` al terminar el archivo, para consultarlo junto a los contenidos sin depender de la máquina que lo procesó. Se sube aunque queden SR con error: lo que lista ya está guardado en destino, y la corrida siguiente regenera el archivo completo.
 
 ### Contenido de los mensajes: `.html` vs `.txt`
 

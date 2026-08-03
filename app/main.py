@@ -1147,10 +1147,18 @@ def download_metadata_file(
     # El indice va aparte, bajo <prefix>/_index/ y sin subcarpeta por host: hay
     # exactamente uno por CSV de metadatos (las particiones son disjuntas), y
     # concatenarlos todos da el indice maestro SR -> ruta de la migracion.
+    # Se sube SIEMPRE, aunque el archivo haya quedado con errores: solo lista
+    # adjuntos confirmados en destino, asi que nunca apunta a lo que no existe;
+    # si esta incompleto, la proxima corrida lo regenera entero. No subirlo
+    # dejaria fuera del indice maestro los adjuntos buenos de un archivo que
+    # nunca llega a completarse.
     with open(index_path, "rb") as fh:
         uploaded = storage.upload_index(os.path.basename(index_path), fh.read())
     if uploaded:
-        logger.info("Indice subido a %s (%d adjuntos)", uploaded, indexed)
+        logger.info(
+            "Indice subido a %s (%d adjuntos%s)",
+            uploaded, indexed, ", archivo con errores pendientes" if errors else "",
+        )
 
     # Verificacion: cada adjunto esperado quedo guardado (descargado u omitido
     # por existir). Una subida/escritura que no lanzo excepcion esta confirmada.
@@ -1558,14 +1566,16 @@ def process_clob_messages_file(
     # El CSV de mensajes ES el indice: trae la metadata de cada mensaje mas su
     # ruta en destino (MessageContent/Location). Con destino GCP se sube a
     # <prefix>/_index/ para consultarlo junto a los contenidos, sin depender de
-    # la maquina que proceso el archivo. Solo se sube si el archivo quedo
-    # completo (sin errores reintentables); si no, se subiria un indice parcial.
-    index_location = None
-    if not errors or errors_all_permanent(errors):
-        with open(messages_path, "rb") as fh:
-            index_location = storage.upload_index(os.path.basename(messages_path), fh.read())
-        if index_location:
-            logger.info("Indice de mensajes subido a %s (%d mensajes)", index_location, message_count)
+    # la maquina que proceso el archivo. Se sube aunque queden SR con error: lo
+    # que lista ya esta guardado, y la proxima corrida regenera el archivo
+    # completo (si no, un archivo que nunca completa se quedaria sin indice).
+    with open(messages_path, "rb") as fh:
+        index_location = storage.upload_index(os.path.basename(messages_path), fh.read())
+    if index_location:
+        logger.info(
+            "Indice de mensajes subido a %s (%d mensajes%s)",
+            index_location, message_count, ", archivo con SR pendientes" if errors else "",
+        )
 
     logger.info(
         "Generado %s_messages.csv%s (%d mensajes: %d html, %d txt, %d ya existentes; %d errores)",

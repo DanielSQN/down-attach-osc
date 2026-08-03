@@ -43,6 +43,26 @@ gs://<bucket>/mensajes/
 
 > El índice **solo** incluye adjuntos confirmados en destino; los fallidos están en `_errores.csv`. Índice + errores = todas las filas del CSV de metadatos que tenían `FileContentsHref`.
 
+### Si falta algún índice en `_index/`
+
+Compara los índices del bucket contra tus CSVs de metadatos:
+
+```powershell
+$enBucket = (gcloud storage ls "$BUCKET/$PREFIX/_index/") | ForEach-Object { Split-Path $_ -Leaf }
+Get-ChildItem "C:\...\METADATA\*_attachments.csv" | ForEach-Object {
+    $esperado = "$($_.BaseName)_index.csv"
+    if ($enBucket -notcontains $esperado) { "FALTA: $esperado" }
+}
+```
+
+Falta un índice si el archivo se procesó con una versión anterior del programa (antes de que existiera el índice). El local sí está en tu `output_folder`, así que basta subirlo:
+
+```powershell
+gcloud storage cp "C:\...\ADJUNTOS_ESTADO\*_index.csv" "$BUCKET/$PREFIX/_index/"
+```
+
+Alternativa (regenera el índice desde cero y lo sube): relanzar ese archivo con `metadata_csv`. Como todo ya está en el bucket, la corrida es rápida (`skipped_existing`).
+
 ---
 
 ## 2. Descargar todo a la máquina de cierre
