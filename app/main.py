@@ -237,7 +237,14 @@ CONTROL_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "Status
 # Indice de busqueda: una fila por adjunto CONFIRMADO en destino (SR -> ruta).
 # Se sube a <prefix>/_index/ en el bucket; concatenando los indices de todos
 # los archivos se obtiene el indice maestro de la migracion.
-INDEX_COLUMNS = [REFERENCE_COLUMN, "FileName", "StoredAs", "Location", "metadata_file"]
+# Incluye los identificadores del adjunto en Oracle (DmDocumentId y, como
+# respaldo, AttachedDocumentId): sirven de id externo al cargar a otro sistema
+# (p. ej. Documento_Externo_Id__c en Salesforce) para que la carga sea
+# idempotente y trazable contra el origen.
+INDEX_COLUMNS = [
+    REFERENCE_COLUMN, "DmDocumentId", "AttachedDocumentId", "FileName",
+    "UploadedFileContentType", "UploadedFileLength", "StoredAs", "Location", "metadata_file",
+]
 # Resumen por solicitud: conteo de adjuntos cargados por Reference Number
 SR_SUMMARY_COLUMNS = [REFERENCE_COLUMN, "total", "cargados", "downloaded", "skipped_existing", "error"]
 # Resumen compacto por archivo (1 fila): totales + host/job para saber de que proceso salio
@@ -1071,9 +1078,15 @@ def download_metadata_file(
                 if crow["Status"] == "error":
                     error_rows.append(crow)
                 elif crow["Status"] in ("downloaded", "skipped_existing"):
+                    # Los identificadores y el tipo/tamano salen de la fila del CSV
+                    # de metadatos, que es la fuente original de Oracle.
                     index_writer.writerow({
                         REFERENCE_COLUMN: crow[REFERENCE_COLUMN],
+                        "DmDocumentId": row.get("DmDocumentId", ""),
+                        "AttachedDocumentId": row.get("AttachedDocumentId", ""),
                         "FileName": crow["FileName"],
+                        "UploadedFileContentType": row.get("UploadedFileContentType", ""),
+                        "UploadedFileLength": row.get("UploadedFileLength", ""),
                         "StoredAs": crow["StoredAs"],
                         "Location": crow["Location"],
                         "metadata_file": file_name,

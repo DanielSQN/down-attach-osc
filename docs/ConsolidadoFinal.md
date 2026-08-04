@@ -36,7 +36,7 @@ gs://<bucket>/mensajes/
 
 | Archivo | Contenido | Una fila por |
 |---|---|---|
-| `_index/<base>_index.csv` | `Reference Number`, `FileName`, `StoredAs`, `Location`, `metadata_file` | adjunto **confirmado en el bucket** |
+| `_index/<base>_index.csv` | `Reference Number`, `DmDocumentId`, `AttachedDocumentId`, `FileName`, `UploadedFileContentType`, `UploadedFileLength`, `StoredAs`, `Location`, `metadata_file` | adjunto **confirmado en el bucket** |
 | `_control/<host>/<base>_resumen.csv` | `metadata_file`, `host`, `job_id`, `processed_at`, `total_solicitudes`, `total_adjuntos`, `cargados`, `downloaded`, `skipped_existing`, `errores`, `sin_href` | archivo procesado |
 | `_control/<host>/<base>_errores.csv` | `Reference Number`, `FileName`, `StoredAs`, `Location`, `Status`, `Code`, `Error` | adjunto **fallido** |
 | `_index/<base>_messages.csv` | campos del mensaje + `MessageContent`, `ContentFormat`, `Location` | mensaje |
@@ -62,6 +62,26 @@ gcloud storage cp "C:\...\ADJUNTOS_ESTADO\*_index.csv" "$BUCKET/$PREFIX/_index/"
 ```
 
 Alternativa (regenera el índice desde cero y lo sube): relanzar ese archivo con `metadata_csv`. Como todo ya está en el bucket, la corrida es rápida (`skipped_existing`).
+
+### Regenerar TODOS los índices (p. ej. tras agregar columnas)
+
+Si los índices del bucket se generaron con una versión que no traía alguna columna (como `DmDocumentId`), se regeneran todos de una sola pasada con `force: true` (ignora el manifiesto y vuelve a tomar todos los archivos) y `overwrite: false` (no re-descarga nada: todo sale `skipped_existing`):
+
+```jsonc
+{
+  "metadata_folder": "C:\\...\\METADATA",
+  "output_folder": "C:\\...\\ADJUNTOS_ESTADO",
+  "destination": "gcp",
+  "gcp_bucket": "dev-tablas-migracion-crm",
+  "gcp_prefix": "adjuntos",
+  "force": true,        // vuelve a tomar los archivos ya procesados
+  "overwrite": false,   // NO re-sube binarios; solo verifica y reescribe el índice
+  "batch_size": 0,
+  "max_workers": 7
+}
+```
+
+Los binarios que falten (los que en su día fallaron) sí se descargan en esa pasada — algo deseable: quedan migrados e indexados.
 
 ---
 
@@ -92,11 +112,38 @@ Import-Csv "$BASE\indices\*.csv" | Export-Csv "$BASE\indice_maestro.csv" -NoType
 
 Un solo CSV con **todos** los adjuntos migrados. Como cada fila trae `metadata_file`, la unión es autodescriptiva y sirve aunque un mismo SR haya aparecido en varios archivos de entrada.
 
-Buscar los adjuntos de una solicitud:
+### Usar el índice para cargar a otro sistema
+
+El índice trae todo lo necesario para una carga aguas abajo: el `Location` de dónde leer el binario, el `Reference Number` para relacionarlo con la solicitud, y el `DmDocumentId` como **id externo** para que la carga sea idempotente (reintentar no duplica) y auditable contra Oracle.
+
+```powershell
+# Filas listas para cargar; usa AttachedDocumentId cuando DmDocumentId venga vacío
+Import-Csv "$BASE\indice_maestro.csv" | ForEach-Object {
+    [pscustomobject]@{
+        sr_number            = $_.'Reference Number'
+        file_name            = $_.FileName
+        documento_externo_id = if ($_.DmDocumentId) { $_.DmDocumentId } else { $_.AttachedDocumentId }
+        gcs_path             = $_.Location
+        content_type         = $_.UploadedFileContentType
+        size                 = $_.UploadedFileLength
+    }
+} | Export-Csv "$BASE\carga_externa.csv" -NoTypeInformation -Encoding UTF8
+```
+
+Comprobación previa recomendada: que no haya ids externos repetidos ni vacíos.
+
+```powershell
+$c = Import-Csv "$BASE\carga_externa.csv"
+($c | Where-Object { -not $_.documento_externo_id }).Count          # debe ser 0
+($c | Group-Object documento_externo_id | Where-Object Count -gt 1).Count   # debe ser 0
+```
+
+### Buscar los adjuntos de una solicitud
 
 ```powershell
 $idx = Import-Csv "$BASE\indice_maestro.csv"
-$idx | Where-Object { $_.'Reference Number' -eq '0002859140' } | Select-Object FileName, Location
+$idx | Where-Object { $_.'Reference Number' -eq '0002859140' } |
+       Select-Object DmDocumentId, FileName, Location
 ```
 
 Total de adjuntos migrados y solicitudes distintas:

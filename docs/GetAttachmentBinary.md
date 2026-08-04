@@ -138,7 +138,23 @@ Una fila por Reference Number: `total`, `cargados`, `downloaded`, `skipped_exist
 
 ### `<nombre>_index.csv` — índice de búsqueda SR → ruta
 
-Una fila por adjunto **confirmado en destino** (descargado u omitido por ya existir): `Reference Number`, `FileName`, `StoredAs` (ruta relativa), `Location` (ruta completa, p. ej. `gs://bucket/adjuntos/0002859140/doc.pdf`) y `metadata_file` (el CSV de origen). Los fallidos **no** se incluyen, así el índice nunca apunta a rutas que no existen; al reintentar el archivo, el índice se regenera completo.
+Una fila por adjunto **confirmado en destino** (descargado u omitido por ya existir):
+
+| Columna | Descripción |
+|---|---|
+| `Reference Number` | La solicitud a la que pertenece el adjunto. |
+| `DmDocumentId` | **Identificador del documento en Oracle.** Pensado para usarse como id externo al cargar a otro sistema (p. ej. `Documento_Externo_Id__c` en Salesforce), de modo que la carga sea idempotente y trazable contra el origen. Puede venir vacío en algunos adjuntos. |
+| `AttachedDocumentId` | Identificador de la fila de adjunto en Oracle. Respaldo cuando `DmDocumentId` viene vacío. |
+| `FileName` | Nombre original del archivo. |
+| `UploadedFileContentType` | MIME declarado por Oracle (útil para el `ContentType` del destino). |
+| `UploadedFileLength` | Tamaño declarado por Oracle (sirve para validar la descarga). |
+| `StoredAs` | Ruta relativa donde quedó, p. ej. `0002859140/doc.pdf`. |
+| `Location` | Ruta completa, p. ej. `gs://bucket/adjuntos/0002859140/doc.pdf`. |
+| `metadata_file` | CSV de metadatos del que salió (trazabilidad del lote). |
+
+Los fallidos **no** se incluyen, así el índice nunca apunta a rutas que no existen; al reintentar el archivo, el índice se regenera completo.
+
+> Cuando dos adjuntos del mismo SR comparten `FileName`, el destino se prefija con el `DmDocumentId` (`0002859140/DM-111_doc.pdf`), así que la pareja `DmDocumentId` + `Location` identifica cada adjunto sin ambigüedad.
 
 Con destino GCP se sube además a `gs://<bucket>/<prefix>/_index/<nombre>_index.csv` (sin subcarpeta por host: hay exactamente un índice por CSV de metadatos). **Se sube siempre, incluso si al archivo le quedaron errores pendientes**: solo lista adjuntos confirmados en destino, así que nunca apunta a lo que no existe, y la corrida siguiente lo regenera completo. La completitud del archivo se lee en `_resumen.csv` / `_errores.csv`, no en el índice. Para obtener el **índice maestro** de toda la migración basta concatenar los índices de todos los archivos — con la columna `metadata_file` incluida, la unión es autodescriptiva. Sirve para localizar los adjuntos de cualquier SR sin saber de qué archivo vino, incluso si un mismo SR apareció en más de un CSV (el índice maestro trae todas sus rutas).
 
